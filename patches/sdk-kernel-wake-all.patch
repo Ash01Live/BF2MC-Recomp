@@ -1,0 +1,174 @@
+diff --git a/runtime/kernel/kernel.h b/runtime/kernel/kernel.h
+index 163ea09..6e12a39 100644
+--- a/runtime/kernel/kernel.h
++++ b/runtime/kernel/kernel.h
+@@ -102,8 +102,6 @@ inline uint32_t CallGuest(X86Context& ctx, uint32_t fn, std::initializer_list<ui
+ // objects
+ enum class ObjType : uint8_t { Event, Semaphore, Mutant, Timer, Thread, File, SymLink, Device, Queue, Other };
+ 
+-struct Waiter;
+-
+ struct Object {
+     ObjType type;
+     uint32_t guest = 0;  // body in guest memory, dispatcher header first for waitables
+@@ -113,7 +111,6 @@ struct Object {
+     bool notification = false;  // manual reset event or notification timer
+     uint32_t owner = 0;         // mutant owner thread
+     uint32_t recursion = 0;
+-    std::vector<Waiter*> waiters;  // Waits blocked on it
+     std::string name;
+     explicit Object(ObjType t) : type(t) {}
+     virtual ~Object() = default;
+diff --git a/runtime/kernel/objects.cpp b/runtime/kernel/objects.cpp
+index 4974985..c57c57c 100644
+--- a/runtime/kernel/objects.cpp
++++ b/runtime/kernel/objects.cpp
+@@ -7,14 +7,10 @@
+ 
+ namespace kernel {
+ 
+-struct Waiter {
+-    std::condition_variable cv;
+-};
+-
+ namespace {
+ 
+ std::mutex g_dispatch;
+-std::vector<Waiter*> g_waiters;  // every blocked Wait, for SignalChanged
++std::condition_variable g_cv;
+ 
+ std::mutex g_handles_lock;
+ std::unordered_map<uint32_t, ObjectRef> g_handles;
+@@ -35,37 +31,7 @@ std::unordered_map<std::string, std::weak_ptr<Object>> g_names;
+ }  // namespace
+ 
+ std::mutex& DispatchLock() { return g_dispatch; }
+-void SignalChanged() {
+-    for (Waiter* w : g_waiters) w->cv.notify_one();
+-}
+-
+-// only the threads blocked on this object; waking every waiter on each signal kept file reader threads busy
+-static void Wake(Object& o) {
+-    for (Waiter* w : o.waiters) w->cv.notify_one();
+-}
+-
+-// a Wait's place on its objects' waiter lists while it blocks, under the dispatcher lock
+-struct Queued {
+-    const std::vector<ObjectRef>& objs;
+-    Waiter w;
+-    bool on = false;
+-    void Add() {
+-        for (auto& o : objs) {
+-            if (o) o->waiters.push_back(&w);
+-        }
+-        g_waiters.push_back(&w);
+-        on = true;
+-    }
+-    void Remove() {
+-        if (!on) return;
+-        for (auto& o : objs) {
+-            if (o) std::erase(o->waiters, &w);
+-        }
+-        std::erase(g_waiters, &w);
+-        on = false;
+-    }
+-    ~Queued() { Remove(); }
+-};
++void SignalChanged() { g_cv.notify_all(); }
+ 
+ uint32_t NewHandle(ObjectRef obj) {
+     std::lock_guard<std::mutex> lock(g_handles_lock);
+@@ -228,7 +194,6 @@ static uint32_t WaitFor(const std::vector<ObjectRef>& objs, bool wait_all, int64
+     bool infinite = timeout == INT64_MAX;
+     int64_t deadline = infinite ? 0 : ToDeadline(timeout);
+     std::unique_lock<std::mutex> lock(g_dispatch);
+-    Queued queued{objs};
+     for (;;) {
+         if (wait_all) {
+             bool all = std::all_of(objs.begin(), objs.end(), [&](const ObjectRef& o) { return o && Satisfied(*o, me); });
+@@ -250,7 +215,6 @@ static uint32_t WaitFor(const std::vector<ObjectRef>& objs, bool wait_all, int64
+                 pending = !self->apcs.empty();
+             }
+             if (pending) {
+-                queued.Remove();
+                 lock.unlock();
+                 RunApcs(*self);
+                 return kUserApc;
+@@ -259,12 +223,10 @@ static uint32_t WaitFor(const std::vector<ObjectRef>& objs, bool wait_all, int64
+         if (!infinite) {
+             int64_t now = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+             if (now >= deadline) return kTimeout;
+-            if (!queued.on) queued.Add();
+             // bounded so alertable waits notice new APCs
+-            queued.w.cv.wait_for(lock, nanoseconds(std::min<int64_t>(deadline - now, 50000000)));
++            g_cv.wait_for(lock, nanoseconds(std::min<int64_t>(deadline - now, 50000000)));
+         } else {
+-            if (!queued.on) queued.Add();
+-            queued.w.cv.wait_for(lock, milliseconds(50));
++            g_cv.wait_for(lock, milliseconds(50));
+         }
+     }
+ }
+@@ -280,7 +242,7 @@ int32_t SetEvent(Object& o) {
+     std::lock_guard<std::mutex> lock(g_dispatch);
+     int32_t old = o.signal;
+     SetSignal(o, 1);
+-    Wake(o);
++    g_cv.notify_all();
+     return old;
+ }
+ 
+@@ -296,7 +258,7 @@ int32_t PulseEvent(Object& o) {
+     std::lock_guard<std::mutex> lock(g_dispatch);
+     int32_t old = o.signal;
+     SetSignal(o, 1);
+-    Wake(o);
++    g_cv.notify_all();
+     return old;
+ }
+ 
+@@ -309,7 +271,7 @@ int32_t ReleaseSemaphore(Object& o, int32_t count, uint32_t& status) {
+     }
+     SetSignal(o, old + count);
+     status = kSuccess;
+-    Wake(o);
++    g_cv.notify_all();
+     return old;
+ }
+ 
+@@ -324,7 +286,7 @@ int32_t ReleaseMutant(Object& o, uint32_t& status) {
+     if (--o.recursion == 0) {
+         o.owner = 0;
+         SetSignal(o, 1);
+-        Wake(o);
++        g_cv.notify_all();
+     }
+     status = kSuccess;
+     return old;
+@@ -407,7 +369,7 @@ static void TimerLoop() {
+         {
+             std::lock_guard<std::mutex> dl(g_dispatch);
+             SetSignal(*e.timer, 1);
+-            Wake(*e.timer);
++            g_cv.notify_all();
+         }
+         if (e.dpc) QueueDpc(e.dpc, uint32_t(Now100ns()), uint32_t(Now100ns() >> 32));
+         if (auto t = e.apc_thread.lock(); t && e.apc_routine)
+diff --git a/runtime/kernel/threads.cpp b/runtime/kernel/threads.cpp
+index a8acfd6..56fadb8 100644
+--- a/runtime/kernel/threads.cpp
++++ b/runtime/kernel/threads.cpp
+@@ -234,11 +234,8 @@ void SuspendPoint() {
+ }
+ 
+ void QueueApc(Thread& t, uint32_t routine, uint32_t a1, uint32_t a2, uint32_t a3) {
+-    {
+-        std::lock_guard<std::mutex> lock(t.apc_lock);
+-        t.apcs.push_back({routine, a1, a2, a3});
+-    }
+-    std::lock_guard<std::mutex> lock(DispatchLock());
++    std::lock_guard<std::mutex> lock(t.apc_lock);
++    t.apcs.push_back({routine, a1, a2, a3});
+     SignalChanged();
+ }
+ 

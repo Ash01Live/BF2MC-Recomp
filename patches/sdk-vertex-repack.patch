@@ -1,0 +1,79 @@
+diff --git a/runtime/gpu/vertex.cpp b/runtime/gpu/vertex.cpp
+index a6afe35..0cfdf7c 100644
+--- a/runtime/gpu/vertex.cpp
++++ b/runtime/gpu/vertex.cpp
+@@ -419,6 +419,66 @@ bool AssembleConverted(const State& s, const Inputs& inputs, const DrawRange& d,
+     return UseIndexList(out);
+ }
+ 
++// [bf2mc patch] Every element has a host format, only a stride or an offset is not on the dword the input
++// assembler needs (BF2:MC's 22 and 18 byte vertices, a 1 byte stream). The elements' own bytes are copied into one
++// aligned interleaved buffer, read raw: far cheaper than converting each element to a float4.
++bool Repackable(const Inputs& inputs) {
++    for (int k = 0; k < inputs.nregs; k++) {
++        HostElement he = HostFormat(inputs.layout.inputs[size_t(inputs.regs[k])].type);
++        if (!he.format || he.bytes > 16) return false;
++    }
++    return true;
++}
++
++bool AssembleRepacked(const State& s, const Inputs& inputs, const DrawRange& d, Assembled& out) {
++    using namespace kernel;
++    int nregs = inputs.nregs;
++    bool ranged = uint64_t(d.span) <= uint64_t(d.count) * kRangedSpanPerVertex + kRangedSpanSlack;
++    std::vector<uint32_t> seq;
++    if (!ranged) {
++        seq.resize(d.count);
++        for (uint32_t i = 0; i < d.count; i++) seq[i] = DrawVertex(s, d, i);
++    }
++    uint32_t n = ranged ? d.span : d.count;
++    // the packed layout: each element at a dword, as many bytes as its host format reads
++    uint32_t offs[16], copy[16], stride = 0;
++    for (int k = 0; k < nregs; k++) {
++        const auto& in = inputs.layout.inputs[size_t(inputs.regs[k])];
++        HostElement he = HostFormat(in.type);
++        offs[k] = stride;
++        copy[k] = std::min<uint32_t>(TypeBytes(in.type), he.bytes);
++        stride += (he.bytes + 3) & ~3u;
++        out.elements[size_t(inputs.regs[k])] = {he.format, 0, uint16_t(offs[k])};
++        out.decode |= uint64_t(he.decode) << (inputs.regs[k] * 4);
++    }
++    out.vertex_count = n;
++    out.vertices.assign((size_t(n) * stride + 3) / 4, 0.0f);
++    uint8_t* dst = reinterpret_cast<uint8_t*>(out.vertices.data());
++    for (int k = 0; k < nregs; k++) {
++        const auto& in = inputs.layout.inputs[size_t(inputs.regs[k])];
++        const auto& st = s.streams[size_t(in.stream)];
++        uint32_t data = mem::VirtualFromPhysical(R32(st.vb + kResData));
++        uint32_t src_stride = StrideOf(s, inputs.layout, in);
++        const uint8_t* src = static_cast<const uint8_t*>(HostPtr(data + in.offset));
++        uint8_t* o = dst + offs[k];
++        uint32_t c = copy[k];
++        for (uint32_t v = 0; v < n; v++) {
++            uint32_t id = ranged ? d.first_vertex + v : seq[v];
++            std::memcpy(o + size_t(v) * stride, src + size_t(id) * src_stride, c);
++        }
++    }
++    out.buffer_count = 1;
++    out.buffers[0] = {dst, n * stride, stride};
++    if (ranged && NativePrimitive(d.prim)) {
++        // the guest's order: dense indices rebased onto the range, or the vertices as they come
++        DrawRange local = d;
++        return DrawNative(local, true, out);
++    }
++    auto local = [&](uint32_t i) { return ranged ? DrawVertex(s, d, i) - d.first_vertex : i; };
++    ListIndices(d.prim, d.count, local, out.indices, out.topology);
++    return UseIndexList(out);
++}
++
+ }  // namespace
+ 
+ void FvfInputs(uint32_t fvf, VertexShader& vs) {
+@@ -481,6 +541,7 @@ bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, con
+     // the guest's own vertices when the input assembler can read every element of them
+     bool raw = kRawVertices && RawReadable(s, inputs);
+     if (raw) return AssembleRaw(s, inputs, d, out);
++    if (kRawVertices && Repackable(inputs)) return AssembleRepacked(s, inputs, d, out);
+     return AssembleConverted(s, inputs, d, out);
+ }
+ 

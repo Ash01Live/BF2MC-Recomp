@@ -1,0 +1,95 @@
+diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
+index 7c8d229..beec183 100644
+--- a/runtime/gpu/d3d12.cpp
++++ b/runtime/gpu/d3d12.cpp
+@@ -2780,11 +2780,13 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+     if (!AssembleDraw(s, prim, start, count, indices, a)) return;
+     // past the ring every upload is a buffer of its own: seconds lost on a frame that draws a whole level once
+     if (CurrentFrame().used > kUploadSize - kUploadReserve) Submit(true);
+-    auto pt = PerfClock::now();
++    // [bf2mc patch] step timers only with XBE_PERF: a clock read costs on every draw
++    const bool perf = diag::Perf();
++    auto pt = perf ? PerfClock::now() : PerfClock::time_point{};
+     if (!BindTargets(s)) return;
+     if (ext_ && ext_->Bound(*this, s, bound_rt_, bound_ds_, a.pretransformed) && !BindTargets(s)) return;
+-    g_perf.targets_ms += PerfMs(pt);
+-    pt = PerfClock::now();
++    if (perf) g_perf.targets_ms += PerfMs(pt);
++    if (perf) pt = PerfClock::now();
+ 
+     // vertex shader
+     DrawShaders sh = ClassifyShaders(s, a, count);
+@@ -2800,8 +2802,8 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+     sh.pkey = Hash(&pk, sizeof(pk));
+     EnsurePixelShader(pk, sh);
+     if (!sh.vs_code || !sh.ps_code) return;
+-    g_perf.shaders_ms += PerfMs(pt);
+-    pt = PerfClock::now();
++    if (perf) g_perf.shaders_ms += PerfMs(pt);
++    if (perf) pt = PerfClock::now();
+ 
+     // pipeline
+     PsoKey k;
+@@ -2809,15 +2811,15 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+     ID3D12PipelineState* pso = EnsurePipeline(k, sh.vs_code, sh.ps_code);
+     if (!pso) return;
+     cl_->SetPipelineState(pso);
+-    g_perf.pso_ms += PerfMs(pt);
+-    pt = PerfClock::now();
++    if (perf) g_perf.pso_ms += PerfMs(pt);
++    if (perf) pt = PerfClock::now();
+ 
+     // constants
+     GuestExtent size;
+     SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
+     DrawConstants c{};
+     UploadConstants(s, sh, k, stages, size, c);
+-    g_perf.consts_ms += PerfMs(pt);
++    if (perf) g_perf.consts_ms += PerfMs(pt);
+ 
+     if (cap_) {
+         CaptureDraw(s, prim, count, k, c, stages);
+@@ -2826,18 +2828,18 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+     }
+ 
+     // texture views and samplers, viewport and scissor, blend factor and stencil reference
+-    pt = PerfClock::now();
++    if (perf) pt = PerfClock::now();
+     SetTextureViewsAndSamplers(s, a, stages);
+     SetViewportScissor(s, size.w);
+     SetBlendFactorStencilRef(s);
+-    g_perf.views_ms += PerfMs(pt);
+-    pt = PerfClock::now();
++    if (perf) g_perf.views_ms += PerfMs(pt);
++    if (perf) pt = PerfClock::now();
+ 
+     // geometry, counted while the title runs a visibility test
+     uint32_t query = BeginCountedDraw(s);
+     DrawGeometry(a);
+     EndCountedDraw(query);
+-    g_perf.geom_ms += PerfMs(pt);
++    if (perf) g_perf.geom_ms += PerfMs(pt);
+ }
+ 
+ // a guest rect scaled to the target and clamped to it
+diff --git a/runtime/gpu/render_thread.cpp b/runtime/gpu/render_thread.cpp
+index 09b85cd..1f33e28 100644
+--- a/runtime/gpu/render_thread.cpp
++++ b/runtime/gpu/render_thread.cpp
+@@ -69,7 +69,15 @@ size_t At(const State& s, const void* p) { return size_t(static_cast<const uint8
+ std::vector<Range> StateRanges() {
+     static const State s;
+     return {
+-        {At(s, &s.simple), At(s, &s.textures) - At(s, &s.simple)},
++        // [bf2mc patch] of the 8 KB of simple render states only those the renderer reads (d3d12.cpp, shaders.cpp):
++        // alpha test to depth offset, the combiner constants, the final combiner constants and the visibility test
++        // switch. The whole block was compared on every draw on the title's thread, BF2:MC's 3000 and more a frame
++        // (as Black's port does)
++        {At(s, &s.simple[kMAlphaTestEnable >> 2]), size_t(kMDepthOffset - kMAlphaTestEnable) + 4},
++        {At(s, &s.simple[kMPsConstant0 >> 2]), size_t(kMPsAlphaOutputs - kMPsConstant0)},
++        {At(s, &s.simple[kMPsFinalConstant0 >> 2]), size_t(kMPsFinalConstant1 - kMPsFinalConstant0) + 4},
++        {At(s, &s.simple[kMCountEnable >> 2]), 4},
++        {At(s, &s.rs), At(s, &s.textures) - At(s, &s.rs)},
+         {At(s, &s.index_buffer), At(s, &s.vs) - At(s, &s.index_buffer)},
+         {At(s, &s.vsc), At(s, &s.rt) - At(s, &s.vsc)},
+         {At(s, &s.scissor_count), At(s, &s.transforms) - At(s, &s.scissor_count)},

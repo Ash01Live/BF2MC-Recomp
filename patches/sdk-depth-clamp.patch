@@ -1,0 +1,28 @@
+diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
+index ba08b7b..1f4b151 100644
+--- a/runtime/gpu/d3d12.cpp
++++ b/runtime/gpu/d3d12.cpp
+@@ -1549,7 +1549,7 @@ void D3D12Backend::FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps,
+     d.RasterizerState.FrontCounterClockwise = k.ccw;
+     d.RasterizerState.DepthBias = k.zbias;
+     d.RasterizerState.SlopeScaledDepthBias = k.zslope;
+-    d.RasterizerState.DepthClipEnable = TRUE;
++    d.RasterizerState.DepthClipEnable = g_depth_clamp ? FALSE : TRUE;  // [bf2mc patch]
+     FillDepthStencilDesc(k, d.DepthStencilState);
+     d.PrimitiveTopologyType = TopologyType(k.topo);
+     d.NumRenderTargets = k.has_rt ? 1 : 0;
+diff --git a/runtime/gpu/ext.h b/runtime/gpu/ext.h
+index ce6acda..910f742 100644
+--- a/runtime/gpu/ext.h
++++ b/runtime/gpu/ext.h
+@@ -90,6 +90,10 @@ public:
+ };
+ 
+ inline std::unique_ptr<Extension> g_extension;
++// [bf2mc patch] true: draws clamp depth to the viewport's range instead of clipping at the near and far planes, as the
++// NV2A does with SET_ZMIN_MAX_CONTROL's ZCLAMP_EN set. Screen space draws with z just under 0 (RenderWare's 2D at
++// z = -0.1) are drawn instead of dropped. Set from GameInfo::init, before the backend is made.
++inline bool g_depth_clamp = false;
+ 
+ // before the backend is made
+ inline void SetExtension(std::unique_ptr<Extension> e) {

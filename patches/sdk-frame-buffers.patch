@@ -1,0 +1,26 @@
+diff --git a/runtime/xdk/d3d8.cpp b/runtime/xdk/d3d8.cpp
+index 5178584..323a765 100644
+--- a/runtime/xdk/d3d8.cpp
++++ b/runtime/xdk/d3d8.cpp
+@@ -270,6 +270,21 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
+         for (uint32_t i = 0; i < g_buffer_count; i++) g_buffers[i] = NewSurface(w, h, color_fmt, 4);
+         g_depth = zf ? NewSurface(w, h, zf, zf == 0x30 || zf == 0x31 ? 2 : 4) : 0;  // 0x30 LIN_D16, 0x31 LIN_F16
+     }
++    // [bf2mc patch] frame buffers the title made itself (BufferSurfaces at +0x34, DepthStencilSurface at +0x40) are
++    // the device's, as the XDK's CreateDevice takes them: the title wraps their memory in textures of its own and
++    // reads the frame back from them for its post processing. The device holds a reference on each. BufferSurfaces[0]
++    // is the first back buffer (g_buffers holds front, back, ...): BF2:MC samples it after its first Swap swaps its two
++    // texture pointers, and started on the front buffer otherwise, feeding each finished frame back into its glow.
++    if (R32(pp + 0x34) && R32(pp + 0x38)) {
++        g_buffer_count = R32(pp + 0x3C) ? 3 : 2;
++        for (uint32_t i = 0; i < g_buffer_count; i++) g_buffers[(i + 1) % g_buffer_count] = R32(pp + 0x34 + i * 4);
++        if (!auto_depth) g_depth = R32(pp + 0x40);
++        for (uint32_t i = 0; i < g_buffer_count; i++) W32(g_buffers[i], R32(g_buffers[i]) + 1);
++        if (g_depth && !auto_depth) W32(g_depth, R32(g_depth) + 1);
++        made = {};  // the next frame buffers the device makes are made anew
++        LOGI("d3d: %s uses the title's frame buffers %08X %08X %08X depth %08X", caller, g_buffers[0], g_buffers[1],
++             g_buffer_count > 2 ? g_buffers[2] : 0, g_depth);
++    }
+     if (!g_backend) {
+         g_backend = gpu::CreateBackend();
+         if (!g_backend->Init(w, h)) {

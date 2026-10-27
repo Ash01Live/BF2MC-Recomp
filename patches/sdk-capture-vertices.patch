@@ -1,0 +1,132 @@
+diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
+index 6ffb480..ba08b7b 100644
+--- a/runtime/gpu/d3d12.cpp
++++ b/runtime/gpu/d3d12.cpp
+@@ -700,6 +700,7 @@ private:
+     Extension* ext_ = nullptr;
+     // one frame capture: every draw in a text file, each target as the frame leaves it, the textures it read
+     FILE* cap_ = nullptr;
++    int cap_burst_ = 0;  // [bf2mc patch] frames of an F3 burst still to capture
+     std::filesystem::path cap_dir_;
+     uint32_t cap_i_ = 0;
+     uint32_t cap_rt_ = 0;
+@@ -2302,14 +2303,46 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
+     cl_->SetGraphicsRootConstantBufferView(1, dc.gpu);
+ }
+ 
++// [bf2mc patch] a 32 bit linear surface's guest memory as a top down bmp
++static void CapWriteGuestBmp(const std::filesystem::path& path, uint32_t data, uint32_t w, uint32_t h) {
++    FILE* f = _wfopen(path.c_str(), L"wb");
++    if (!f) return;
++    uint32_t pitch = (w * 4 + 63) & ~63u, size = w * h * 4;
++    uint8_t hd[54] = {'B', 'M'};
++    auto put = [&](int o, uint32_t v) { std::memcpy(hd + o, &v, 4); };
++    put(2, 54 + size);
++    put(10, 54);
++    put(14, 40);
++    put(18, w);
++    put(22, uint32_t(-int32_t(h)));
++    hd[26] = 1;
++    hd[28] = 32;
++    put(34, size);
++    fwrite(hd, 1, sizeof(hd), f);
++    const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(data));
++    for (uint32_t y = 0; y < h; y++) fwrite(p + size_t(y) * pitch, 1, w * 4, f);
++    fclose(f);
++}
++
+ void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
+     for (int i = 0; i < 4; i++) {
+         ID3D12Resource* res = stages.res[i];
+         TextureDesc d;
+         if (!s.textures[size_t(i)] || !Describe(s.textures[size_t(i)], d)) continue;
+-        bool tg = targets_.count(SizedTargetKey(d.data, Format(d.format).depth, d.width, d.height));
++        auto tgi = targets_.find(SizedTargetKey(d.data, Format(d.format).depth, d.width, d.height));
++        bool tg = tgi != targets_.end();
+         fprintf(cap_, " | t%d %08X fmt %X %ux%u%s%s", i, d.data, d.format, d.width, d.height, tg ? " target" : "",
+                 res ? "" : " unbound");
++        // [bf2mc patch] a sampled target's state and, once, its guest memory: shows CPU writes the host copy missed
++        if (tg) {
++            fprintf(cap_, " (drawn %d epoch %llu/%llu)", tgi->second.drawn ? 1 : 0,
++                    (unsigned long long)tgi->second.epoch, (unsigned long long)DirtyEpoch(d.data));
++            if (!Format(d.format).depth && (d.format == 0x12 || d.format == 0x1E) && cap_seen_.insert(d.data).second) {
++                char name[32];
++                snprintf(name, sizeof(name), "mem_%08X.bmp", d.data);
++                CapWriteGuestBmp(cap_dir_ / name, d.data, d.width, d.height);
++            }
++        }
+         if (res && !tg && stages.info[i].kind == kTex2D && cap_seen_.insert(d.data).second) {
+             cap_tex_.push_back({res, stages.sv[i].Format, d.data, d.width, d.height});
+         }
+@@ -2329,6 +2362,38 @@ void D3D12Backend::CaptureInputs(const State& s, const Assembled& a, const DrawC
+         for (uint32_t k = 0; k < n * 4; k++) fprintf(cap_, " %g", a.vertices[v * n * 4 + k]);
+         fprintf(cap_, " ]");
+     }
++    // [bf2mc patch] vertices read from the title's own buffers: the first four, each input register
++    if (a.vertices.empty()) {
++        for (uint32_t v = 0; v < std::min<uint32_t>(4, a.vertex_count); v++) {
++            fprintf(cap_, " [");
++            for (int r = 0; r < 16; r++) {
++                if (!(a.regs >> r & 1)) continue;
++                const VertexElement& e = a.elements[size_t(r)];
++                const VertexBuffer& vb = a.buffers[e.buffer];
++                if (!vb.src) continue;
++                uint32_t off = v * vb.stride + e.offset;
++                int nf = e.format == DXGI_FORMAT_R32G32B32A32_FLOAT ? 4
++                       : e.format == DXGI_FORMAT_R32G32B32_FLOAT    ? 3
++                       : e.format == DXGI_FORMAT_R32G32_FLOAT       ? 2
++                       : e.format == DXGI_FORMAT_R32_FLOAT          ? 1
++                                                                    : 0;
++                if (off + uint32_t(nf ? nf * 4 : 4) > vb.bytes) continue;
++                fprintf(cap_, " v%d:", r);
++                if (nf) {
++                    for (int k = 0; k < nf; k++) {
++                        float f;
++                        std::memcpy(&f, vb.src + off + k * 4, 4);
++                        fprintf(cap_, " %g", f);
++                    }
++                } else {
++                    uint32_t u;
++                    std::memcpy(&u, vb.src + off, 4);
++                    fprintf(cap_, " %08X/f%u", u, unsigned(e.format));
++                }
++            }
++            fprintf(cap_, " ]");
++        }
++    }
+     for (int r = 0; r < kVsConstants; r++) {
+         const auto& v = s.vsc[r];
+         if (v[0] || v[1] || v[2] || v[3]) {
+@@ -2355,7 +2420,7 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
+ 
+ // small draws: their inputs and constants; then ends the draw's line
+ void D3D12Backend::EndDrawCapture(const State& s, const Assembled& a, uint32_t count, const DrawConstants& c) {
+-    if (count <= kQuadVertices) CaptureInputs(s, a, c);
++    if (count <= 1024) CaptureInputs(s, a, c);  // [bf2mc patch] was kQuadVertices
+     fputc('\n', cap_);
+ }
+ 
+@@ -2963,7 +3028,8 @@ void D3D12Backend::StartCapture() {
+     SYSTEMTIME tm;
+     GetLocalTime(&tm);
+     char stamp[32];
+-    snprintf(stamp, sizeof(stamp), "%02u%02u%02u", tm.wHour, tm.wMinute, tm.wSecond);
++    snprintf(stamp, sizeof(stamp), "%02u%02u%02u_%06llu", tm.wHour, tm.wMinute, tm.wSecond,
++             (unsigned long long)(frame_ % 1000000));
+     std::error_code ec;
+     cap_dir_ = std::filesystem::weakly_canonical(app::ExeDir() / diag::CaptureDir() / stamp, ec);
+     std::filesystem::create_directories(cap_dir_, ec);
+@@ -3122,9 +3188,13 @@ void LogPerf() {
+ 
+ void D3D12Backend::Present(const Surface& front) {
+     PerfScope perf_present{g_perf.present};
++    // [bf2mc patch] F3 captures kCaptureBurst frames in a row, so a one frame event between them is caught
++    constexpr int kCaptureBurst = 8;
+     if (cap_) {
+         FinishCapture(front);
++        if (--cap_burst_ > 0) StartCapture();
+     } else if (g_capture.exchange(false) && CaptureOn()) {
++        cap_burst_ = kCaptureBurst;
+         StartCapture();
+     }
+     ResizeSwap();

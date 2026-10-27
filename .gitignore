@@ -1,0 +1,37 @@
+# build
+/out/
+/build/
+*.zip
+*.pdb
+*.exe
+*.obj
+*.o
+
+# recompiled code, derived from the game
+/generated/
+
+# user's own game files
+/assets/
+
+# runtime files
+settings.toml
+/logs/
+/hdd/
+/CrashDumps/
+
+# editors
+.vs/
+.vscode/
+.idea/
+
+# Local temporary folder
+.local
+
+# the game's own files never go in this repository
+/game/
+*.xbe
+*.iso
+*.viv
+
+# NVIDIA NVAPI, cloned for building (see BUILDING.md)
+/nvapi/

@@ -1,0 +1,152 @@
+diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
+index 1066001..5b479df 100644
+--- a/runtime/gpu/d3d12.cpp
++++ b/runtime/gpu/d3d12.cpp
+@@ -700,6 +700,8 @@ private:
+     std::unordered_map<uint64_t, Tex> pack_textures_;  // texture pack images by key, kept for the run
+     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> blit_psos_;
+     Extension* ext_ = nullptr;
++    uint64_t gun_frame_ = ~0ull;  // [bf2mc patch] the frame world_zoom_ was taken in
++    float world_zoom_ = 0;
+     // one frame capture: every draw in a text file, each target as the frame leaves it, the textures it read
+     FILE* cap_ = nullptr;
+     int cap_burst_ = 0;  // [bf2mc patch] frames of an F3 burst still to capture
+@@ -921,8 +923,17 @@ void D3D12Backend::CreateGammaLut() {
+                                   IID_PPV_ARGS(&lut_));
+ }
+ 
++// [bf2mc patch] ultrawide: the frame is stretched across the window's width, so targets get the scale that gives
++// one host pixel per window pixel across (more than enough down, which the present shrinks)
++static float UltrawideScale(uint32_t gw, uint32_t gh) {
++    if (!g_ultrawide || !app::Widescreen() || !gw || !gh) return 1;
++    app::Mode m = app::Output();
++    float across = float(m.width) / std::max(m.height, 1u) * float(gh) / float(gw);  // host x per host y
++    return std::max(across, 1.0f);
++}
++
+ void D3D12Backend::LoadSettings() {
+-    scale_ = app::RenderScale(guest_h_);
++    scale_ = app::RenderScale(guest_h_) * UltrawideScale(guest_w_, guest_h_);
+     texturedumper::Update();
+     ext_ = g_extension.get();
+     if (ext_) {
+@@ -2290,6 +2301,44 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
+     std::memcpy(vc.cpu, s.vsc.data(), sizeof(s.vsc));
+     Alloc dc = Upload(sizeof(DrawConstants), 256);
+     FillSurfaceConstants(s, size, c);
++    // [bf2mc patch] ultrawide squeeze, on frame sized targets: depth tested 3D by g_squeeze, 2D drawn with depth
++    // ALWAYS (HUD, menus) to 4:3 by g_squeeze_2d. Untouched: draws reading a frame sized target (the frame's full
++    // screen passes) and draws without depth test (full screen fades and tints)
++    constexpr uint32_t kZAlways = 0x207;
++    c.squeeze[0] = 1;
++    if (g_squeeze != 1 && size.w == guest_w_ && size.h == guest_h_ && k.zen) {
++        bool reads_frame = false;
++        for (int i = 0; i < 4; i++) {
++            TextureDesc td;
++            if (stages.rt[i] && s.textures[size_t(i)] && Describe(s.textures[size_t(i)], td))
++                reads_frame |= td.width == guest_w_ && td.height == guest_h_;
++        }
++        if (!reads_frame) c.squeeze[0] = k.zfunc == kZAlways ? g_squeeze_2d : g_squeeze;
++        // [bf2mc patch] gun field of view. The title's vertex programs build clip position from c-95..c-92
++        // (vsc[1..4]); the first person gun shares the world's view at a closer zoom (its x and y rows longer by
++        // 1.425). The frame's first depth tested 3D draw is the world's: a draw zoomed apart from it is the gun's,
++        // its x and y rows scaled by g_gun_zoom.
++        // Rows are read from the state's copy: vc.cpu is write combined upload memory, slow to read back.
++        // World draws (the rest) get both rows scaled by g_world_scale: the title widens its camera for culling
++        // at the window's sides, and the world is grown back by as much, undoing the squeeze across.
++        if (!reads_frame && k.zfunc != kZAlways && (g_gun_zoom != 1 || g_world_scale != 1)) {
++            const auto& r = s.vsc;
++            auto* v = reinterpret_cast<float(*)[4]>(vc.cpu);
++            auto len = [](const std::array<float, 4>& x) { return std::sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]); };
++            float w = len(r[4]), zoom = w > 0 ? len(r[2]) / w : 0;
++            if (zoom > 0) {
++                if (gun_frame_ != frame_) {
++                    gun_frame_ = frame_;
++                    world_zoom_ = zoom;
++                }
++                bool gun = std::fabs(zoom - world_zoom_) > world_zoom_ * 0.02f;
++                float k = gun ? g_gun_zoom : g_world_scale;
++                if (k != 1)
++                    for (int row = 1; row <= 2; row++)
++                        for (int i = 0; i < 4; i++) v[row][i] = r[size_t(row)][size_t(i)] * k;
++            }
++        }
++    }
+     // points: host pixels per console pixel, also keeps them off the far edge pull out of screen passes
+     if (k.topo == uint32_t(Topology::Points)) c.surf[3] = TargetScale();
+     FillFogConstants(s, sh.prog, c);
+@@ -3086,6 +3135,10 @@ void D3D12Backend::BlitFrame(Target& t) {
+     float aspect = wide ? 16.0f / 9.0f : 4.0f / 3.0f;
+     float w = float(bb_w_);
+     float h = float(bb_h_);
++    // [bf2mc patch] ultrawide: the window's shape when wider than 16:9; the draws were squeezed by g_squeeze to match
++    if (g_ultrawide && wide && w > h * aspect) aspect = w / h;
++    g_squeeze = g_ultrawide && wide ? 16.0f / 9.0f / aspect : 1.0f;
++    g_squeeze_2d = g_ultrawide && wide ? 4.0f / 3.0f / aspect : 1.0f;
+     float vw = std::min(w, h * aspect);
+     float vh = vw / aspect;
+     float uv[4] = {0, 0, 1, 1};
+@@ -3248,7 +3301,7 @@ void D3D12Backend::WaitGpuFrame(uint64_t n) {
+ 
+ void D3D12Backend::ApplySettings() {
+     if (texturedumper::Update()) ReleasePackTextures();
+-    float want = app::RenderScale(guest_h_);
++    float want = app::RenderScale(guest_h_) * UltrawideScale(guest_w_, guest_h_);
+     bool remake = ext_ && ext_->Settings();
+     if (std::fabs(want - scale_) > 1e-4f || remake) {
+         Flush();
+diff --git a/runtime/gpu/ext.h b/runtime/gpu/ext.h
+index 910f742..bb6c472 100644
+--- a/runtime/gpu/ext.h
++++ b/runtime/gpu/ext.h
+@@ -90,6 +90,17 @@ public:
+ };
+ 
+ inline std::unique_ptr<Extension> g_extension;
++
++// [bf2mc patch] ultrawide: the frame is shown at the window's shape, wider than 16:9, and the draws on the title's
++// frame sized targets are squeezed to undo the stretch. The 3D scene (depth tested) then shows more at the sides;
++// 2D (HUD, menus) stays a 16:9 block in the middle. Draws reading a render target (full screen passes) are left be.
++inline bool g_ultrawide = false;
++inline float g_squeeze = 1.0f;     // 16:9 over the window's shape, set each present
++inline float g_squeeze_2d = 1.0f;  // 2D: the title's HUD and menus are 4:3 art, stretched on a 16:9 console
++// [bf2mc patch] the first person gun's x and y projection rows are scaled by this (1 the game's, below 1 wider)
++inline float g_gun_zoom = 1.0f;
++// [bf2mc patch] the world's x and y projection rows are scaled by this (the title's camera widened by as much)
++inline float g_world_scale = 1.0f;
+ // [bf2mc patch] true: draws clamp depth to the viewport's range instead of clipping at the near and far planes, as the
+ // NV2A does with SET_ZMIN_MAX_CONTROL's ZCLAMP_EN set. Screen space draws with z just under 0 (RenderWare's 2D at
+ // z = -0.1) are drawn instead of dropped. Set from GameInfo::init, before the backend is made.
+diff --git a/runtime/gpu/shaders.cpp b/runtime/gpu/shaders.cpp
+index 295246a..ae6ccf7 100644
+--- a/runtime/gpu/shaders.cpp
++++ b/runtime/gpu/shaders.cpp
+@@ -54,6 +54,7 @@ const char* kCommonTail = R"(    float4 spread[4];
+     float4 amb;
+     float4 lt[56];
+     float4 rtshift;
++    float4 squeeze;
+ };
+ )";
+ 
+@@ -226,7 +227,7 @@ const char* kVsEpilogue = R"(
+     // surf.w set: a point, which stays put since pulled out it would leave the target
+     if (surf.w == 0 && abs(p.x - (surf.x - 0.5)) < 1e-3) p.x = surf.x;
+     if (surf.w == 0 && abs(p.y - (surf.y - 0.5)) < 1e-3) p.y = surf.y;
+-    q.x = p.x * 2 / surf.x - 1;
++    q.x = (p.x * 2 / surf.x - 1) * squeeze.x;
+     q.y = 1 - p.y * 2 / surf.y;
+     q.z = p.z * surf.z;
+     q.xyz *= p.w;
+diff --git a/runtime/gpu/shaders.h b/runtime/gpu/shaders.h
+index 5f47b66..04cceba 100644
+--- a/runtime/gpu/shaders.h
++++ b/runtime/gpu/shaders.h
+@@ -101,6 +101,7 @@ struct DrawConstants {
+     float amb[4];        // D3DRS_AMBIENT
+     float lt[8][7][4];   // per light: diffuse, specular, ambient, position range, direction falloff, attenuation, cos theta/2 phi/2
+     float rtshift[4];    // per kTexTarget stage: host pixels its reads move along x and y, negative up and left
++    float squeeze[4];    // [bf2mc patch] x: the draw's horizontal scale about the target's centre (g_squeeze)
+ };
+ 
+ }  // namespace gpu

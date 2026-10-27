@@ -1,0 +1,40 @@
+diff --git a/runtime/xdk/d3d8.cpp b/runtime/xdk/d3d8.cpp
+index 323a765..5b7484a 100644
+--- a/runtime/xdk/d3d8.cpp
++++ b/runtime/xdk/d3d8.cpp
+@@ -351,6 +351,12 @@ void VerticalBlank(X86Context& ctx) {
+ 
+ gpu::State& State() { return g_state; }
+ std::recursive_mutex& Lock() { return g_lock; }
++void FinishQueuedDraws() {
++    std::lock_guard<std::recursive_mutex> lock(g_lock);
++    Walk(Dev(kDevPush));
++    // the render thread reads what is queued; the GPU is not waited for (Flush would, per quad)
++    if (g_backend) g_backend->WaitFence(g_backend->Fence());
++}
+ 
+ }  // namespace d3d
+ 
+@@ -435,6 +441,9 @@ HLE_WRAP(Lock2DSurface, 6) {
+         std::lock_guard<std::recursive_mutex> lock(g_lock);
+         g_backend->SyncLate(mem::VirtualFromPhysical(R32(res + 4)));
+     }
++    // [bf2mc patch] a lock is the CPU's way in: mark it so writes after it reach the renderer. A NOOVERWRITE lock skips
++    // BlockOnResource, which marks the others, so a surface the title fills every frame (a movie frame) stayed stale.
++    if ((a[5] & 0x20) && res) gpu::MarkDirty(res);
+ }
+ HLE_STDCALL(D3DResource_BlockUntilNotBusy, 1) {
+     if (a[0] && g_backend) {
+diff --git a/runtime/xdk/d3d8.h b/runtime/xdk/d3d8.h
+index 977d028..e3ca73e 100644
+--- a/runtime/xdk/d3d8.h
++++ b/runtime/xdk/d3d8.h
+@@ -7,5 +7,8 @@ namespace d3d {
+ 
+ gpu::State& State();
+ std::recursive_mutex& Lock();
++// [bf2mc patch] every draw queued so far is read by the renderer before this returns: for a title about to refill
++// vertex memory those draws still point at, without a lock the library would see
++void FinishQueuedDraws();
+ 
+ }  // namespace d3d

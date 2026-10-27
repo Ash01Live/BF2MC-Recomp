@@ -1,0 +1,255 @@
+diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
+index 6abcff6..b650940 100644
+--- a/runtime/gpu/d3d12.cpp
++++ b/runtime/gpu/d3d12.cpp
+@@ -563,6 +563,7 @@ private:
+     void DrawGeometry(const Assembled& a);
+     void UploadVertexBuffers(const Assembled& a);
+     void HudNative(const State& s, GuestExtent size, DrawConstants& c);  // [bf2mc patch]
++    void HudLayout(const Assembled& a, uint32_t buffer, uint8_t* dst);  // [bf2mc patch]
+     // visibility tests
+     bool EnsureQueries();
+     uint32_t BeginCountedDraw(const State& s);
+@@ -707,6 +708,9 @@ private:
+     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> blit_psos_;
+     Extension* ext_ = nullptr;
+     uint64_t gun_frame_ = ~0ull;  // [bf2mc patch] the frame world_zoom_ was taken in
++    bool hud_layout_ = false;     // [bf2mc patch] this draw is play HUD for HudLayout
++    bool hud_quads_ = false;      // [bf2mc patch] this draw is a list of quads
++    uint32_t hud_tex_ = 0;        // [bf2mc patch] its first texture, which HudLayout follows pieces by
+     float world_zoom_ = 0;
+     // one frame capture: every draw in a text file, each target as the frame leaves it, the textures it read
+     FILE* cap_ = nullptr;
+@@ -2324,15 +2328,23 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
+     constexpr uint32_t kZAlways = 0x207;
+     c.squeeze[0] = 1;
+     c.hud[0] = c.hud[1] = 1;
++    hud_layout_ = false;
+     // [bf2mc patch] 2D on the frame (zfunc ALWAYS, not one of its full screen passes): see HudNative
+-    if (g_hud_native > 0 && size.w == guest_w_ && size.h == guest_h_ && k.zen && k.zfunc == 0x207) {
++    if ((g_hud_native > 0 || g_hud_scale != 1 || g_hud_edge != 0) && size.w == guest_w_ && size.h == guest_h_ &&
++        k.zen && k.zfunc == 0x207) {
+         bool reads_frame = false;
+         for (int i = 0; i < 4; i++) {
+             TextureDesc td;
+             if (stages.rt[i] && s.textures[size_t(i)] && Describe(s.textures[size_t(i)], td))
+                 reads_frame |= td.width == guest_w_ && td.height == guest_h_;
+         }
+-        if (!reads_frame) HudNative(s, size, c);
++        if (!reads_frame && g_hud_native > 0) HudNative(s, size, c);
++        // [bf2mc patch] the rest of the play HUD (not art HudNative scaled) goes to HudLayout
++        uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
++                                    std::chrono::steady_clock::now().time_since_epoch()).count());
++        hud_layout_ = !reads_frame && c.hud[0] == 1 && (g_hud_scale != 1 || g_hud_edge != 0) &&
++                      now - g_hud_play_ms.load(std::memory_order_relaxed) < 250;
++        hud_tex_ = s.textures[0];
+     }
+     if (g_squeeze != 1 && size.w == guest_w_ && size.h == guest_h_ && k.zen) {
+         bool reads_frame = false;
+@@ -2433,6 +2445,151 @@ void D3D12Backend::HudNative(const State& s, GuestExtent size, DrawConstants& c)
+     c.hud[3] = (lo[1] + hi[1]) * 0.5f;
+ }
+ 
++// [bf2mc patch] The play HUD laid out for a wide window. The title draws its HUD as 640x480 art, kept 4:3 in the
++// middle of the window, and big: built for a television across the room. Each draw's quads are grouped into the
++// pieces they make (quads within a few pixels of each other: a word, a gauge, the map), and each piece is scaled by
++// g_hud_scale. A piece that stays put (followed from frame to frame by its texture and place: an edge or its middle
++// keeps still each way, as when only its text changes; kSettleMs still, after the HUD slides in) and sits by a side
++// or a corner of the art is
++// scaled about that corner or side's middle, which also moves g_hud_edge of the way out to the window's edge (the
++// left and right; top and bottom are the window's already), so it keeps its shape and its margin shrinks with it.
++// A piece that moves again after settling (a marker over a soldier, a distance) is scaled about its own middle from
++// then on, and so is a new one until it settles. A still piece in the middle (the pause menu) is left as it is. The
++// vertices are moved in the draw's uploaded copy, write combined: read back from the source.
++void D3D12Backend::HudLayout(const Assembled& a, uint32_t buffer, uint8_t* dst) {
++    constexpr float kW = 640, kH = 480;
++    constexpr float kJoin = 6;       // pixels between quads of one piece
++    constexpr float kFollow = 40;    // pixels a piece's middle goes from one frame to the next and is still that piece
++    constexpr float kStill = 0.5f;   // pixels an edge may move and keep still
++    constexpr uint64_t kSettleMs = 400;
++    constexpr uint32_t kMaxQuads = 1024;
++    const VertexElement& pe = a.elements[0];
++    if (pe.format != DXGI_FORMAT_R32G32B32_FLOAT && pe.format != DXGI_FORMAT_R32G32B32A32_FLOAT) return;
++    const VertexBuffer& pb = a.buffers[buffer];
++    uint32_t n = a.vertex_count;
++    if (!pb.src || !pb.stride || n < 3 || uint64_t(n - 1) * pb.stride + pe.offset + 8 > pb.bytes) return;
++    uint32_t per = hud_quads_ && n % 4 == 0 ? 4 : n;  // a quad list's quads, else the draw as one
++    uint32_t quads = n / per;
++    if (quads > kMaxQuads) return;
++    auto src = [&](uint32_t v, float* xy) { std::memcpy(xy, pb.src + size_t(v) * pb.stride + pe.offset, 8); };
++    struct Box {
++        float x0, y0, x1, y1;
++        int piece;
++    };
++    static std::vector<Box> boxes;
++    boxes.resize(quads);
++    for (uint32_t q = 0; q < quads; q++) {
++        Box& b = boxes[q];
++        b = {1e30f, 1e30f, -1e30f, -1e30f, int(q)};
++        for (uint32_t v = q * per; v < q * per + per; v++) {
++            float p[2];
++            src(v, p);
++            b.x0 = std::min(b.x0, p[0]), b.y0 = std::min(b.y0, p[1]);
++            b.x1 = std::max(b.x1, p[0]), b.y1 = std::max(b.y1, p[1]);
++        }
++    }
++    // pieces: quads that touch (within kJoin) share one, the lowest index
++    auto root = [&](int i) {
++        while (boxes[size_t(i)].piece != i) i = boxes[size_t(i)].piece = boxes[size_t(boxes[size_t(i)].piece)].piece;
++        return i;
++    };
++    for (uint32_t i = 0; i < quads; i++)
++        for (uint32_t j = i + 1; j < quads; j++) {
++            const Box &p = boxes[i], &q = boxes[j];
++            if (p.x0 - kJoin > q.x1 || q.x0 - kJoin > p.x1 || p.y0 - kJoin > q.y1 || q.y0 - kJoin > p.y1) continue;
++            int ri = root(int(i)), rj = root(int(j));
++            if (ri != rj) boxes[size_t(std::max(ri, rj))].piece = std::min(ri, rj);
++        }
++    struct Piece {
++        float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
++        float ox = 0, oy = 0, k = 1;  // p' = o + p * k
++    };
++    static std::vector<Piece> pieces;
++    pieces.assign(quads, Piece{});
++    for (uint32_t q = 0; q < quads; q++) {
++        Piece& p = pieces[size_t(root(int(q)))];
++        const Box& b = boxes[q];
++        p.x0 = std::min(p.x0, b.x0), p.y0 = std::min(p.y0, b.y0);
++        p.x1 = std::max(p.x1, b.x1), p.y1 = std::max(p.y1, b.y1);
++    }
++    // the pieces followed from frame to frame
++    struct Track {
++        uint32_t tex;
++        float x0, y0, x1, y1;
++        uint64_t still_ms, seen_frame;  // still since
++        bool settled, marker;  // has kept still kSettleMs; moved again after that
++    };
++    static std::vector<Track> tracks;
++    uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
++                                std::chrono::steady_clock::now().time_since_epoch()).count());
++    static uint64_t pruned = ~0ull;
++    if (pruned != frame_) {
++        pruned = frame_;
++        std::erase_if(tracks, [&](const Track& t) { return frame_ - t.seen_frame > 30; });
++    }
++    // the window's left edge in the art's pixels: the 2D squeeze shows the art 4:3 in the middle
++    float out = g_squeeze_2d > 0 && g_squeeze_2d < 1 ? kW * 0.5f * (1 / g_squeeze_2d - 1) : 0;
++    float k = std::clamp(g_hud_scale, 0.1f, 2.0f), edge = std::clamp(g_hud_edge, 0.0f, 1.0f) * out;
++    for (uint32_t q = 0; q < quads; q++) {
++        if (root(int(q)) != int(q)) continue;
++        Piece& p = pieces[q];
++        if (p.x1 - p.x0 > kW * 0.8f && p.y1 - p.y0 > kH * 0.8f) continue;  // full screen
++        float cx = (p.x0 + p.x1) * 0.5f, cy = (p.y0 + p.y1) * 0.5f;
++        // its track: the nearest of this texture seen lately, not yet matched this frame
++        Track* t = nullptr;
++        float best = kFollow * kFollow;
++        for (Track& c : tracks) {
++            if (c.tex != hud_tex_ || c.seen_frame == frame_) continue;
++            float dx = (c.x0 + c.x1) * 0.5f - cx, dy = (c.y0 + c.y1) * 0.5f - cy, d = dx * dx + dy * dy;
++            if (d < best) best = d, t = &c;
++        }
++        if (!t) {
++            tracks.push_back({hud_tex_, p.x0, p.y0, p.x1, p.y1, now, frame_, false, false});
++            t = &tracks.back();
++        } else {
++            // still: an edge or the middle keeps its place each way (text that changes keeps one of them)
++            auto keeps = [&](float a0, float a1, float b0, float b1) {
++                return std::fabs(a0 - b0) < kStill || std::fabs(a1 - b1) < kStill ||
++                       std::fabs((a0 + a1) - (b0 + b1)) < 2 * kStill;
++            };
++            bool still = keeps(t->x0, t->x1, p.x0, p.x1) && keeps(t->y0, t->y1, p.y0, p.y1);
++            if (!still) {
++                // the HUD slides in when the soldier spawns, then keeps still: what moves after settling is a marker
++                if (t->settled) t->marker = true;
++                t->still_ms = now;
++            }
++            t->x0 = p.x0, t->y0 = p.y0, t->x1 = p.x1, t->y1 = p.y1, t->seen_frame = frame_;
++        }
++        if (!t->marker && now - t->still_ms >= kSettleMs) t->settled = true;
++        bool fixed = t->settled && !t->marker;
++        int col = cx < kW / 3 ? 0 : cx > kW * 2 / 3 ? 2 : 1;
++        int row = cy < kH / 3 ? 0 : cy > kH * 2 / 3 ? 2 : 1;
++        float ax, ay, bx;  // about (ax, ay), which moves to (bx, ay)
++        if (!fixed) {
++            ax = bx = cx, ay = cy;
++        } else if (col == 1 && row == 1) {
++            continue;
++        } else {
++            ax = col * kW * 0.5f, ay = row * kH * 0.5f;
++            bx = ax + (col == 0 ? -edge : col == 2 ? edge : 0);
++        }
++        p.k = k;
++        p.ox = bx - ax * k;
++        p.oy = ay - ay * k;
++    }
++    for (uint32_t q = 0; q < quads; q++) {
++        const Piece& p = pieces[size_t(root(int(q)))];
++        if (p.k == 1 && p.ox == 0 && p.oy == 0) continue;
++        for (uint32_t v = q * per; v < q * per + per; v++) {
++            float xy[2];
++            src(v, xy);
++            xy[0] = p.ox + xy[0] * p.k;
++            xy[1] = p.oy + xy[1] * p.k;
++            std::memcpy(dst + size_t(v) * pb.stride + pe.offset, xy, 8);
++        }
++    }
++}
++
+ // [bf2mc patch] a 32 bit linear surface's guest memory as a top down bmp
+ static void CapWriteGuestBmp(const std::filesystem::path& path, uint32_t data, uint32_t w, uint32_t h) {
+     FILE* f = _wfopen(path.c_str(), L"wb");
+@@ -2650,7 +2807,8 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
+     LONG y0 = LONG(s.viewport.y * sc);
+     LONG x1 = LONG((s.viewport.x + s.viewport.w) * sc);
+     LONG y1 = LONG((s.viewport.y + s.viewport.h) * sc);
+-    if (s.scissor_count) {
++    if (hud_layout_) x0 = 0, y0 = 0, x1 = LONG(W), y1 = LONG(H);  // [bf2mc patch] HUD moved out of its clip
++    else if (s.scissor_count) {
+         x0 = std::max(x0, LONG(s.scissors[0] * sc));
+         y0 = std::max(y0, LONG(s.scissors[1] * sc));
+         x1 = std::min(x1, LONG(s.scissors[2] * sc));
+@@ -2682,6 +2840,7 @@ void D3D12Backend::UploadVertexBuffers(const Assembled& a) {
+         const VertexBuffer& b = a.buffers[i];
+         Alloc vb = Upload(b.bytes, 16);
+         std::memcpy(vb.cpu, b.src, b.bytes);
++        if (hud_layout_ && i == a.elements[0].buffer) HudLayout(a, i, static_cast<uint8_t*>(vb.cpu));  // [bf2mc patch]
+         vbv[i] = {vb.gpu, b.bytes, b.stride};
+     }
+     cl_->IASetVertexBuffers(0, a.buffer_count, vbv);
+@@ -2794,6 +2953,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+     if (ext_) ext_->BeginDraw(s);
+     Assembled& a = asm_;
+     if (!AssembleDraw(s, prim, start, count, indices, a)) return;
++    hud_quads_ = prim == 8;  // [bf2mc patch] D3DPT_QUADLIST
+     // past the ring every upload is a buffer of its own: seconds lost on a frame that draws a whole level once
+     if (CurrentFrame().used > kUploadSize - kUploadReserve) Submit(true);
+     // [bf2mc patch] step timers only with XBE_PERF: a clock read costs on every draw
+diff --git a/runtime/gpu/ext.h b/runtime/gpu/ext.h
+index 8e6cdbf..20f9612 100644
+--- a/runtime/gpu/ext.h
++++ b/runtime/gpu/ext.h
+@@ -10,8 +10,10 @@
+ #include <d3d12.h>
+ #include <wrl/client.h>
+ 
++#include <atomic>
+ #include <cstdint>
+ #include <memory>
++#include <mutex>
+ #include <vector>
+ 
+ #include "gpu/shaders.h"
+@@ -102,6 +104,13 @@ inline float g_squeeze_2d = 1.0f;
+ inline float g_hud_native = 0.0f;
+ // [bf2mc patch] a swap chain that queues one frame, not three: less input latency at the display's rate
+ inline bool g_low_latency = true;  // 2D: the title's HUD and menus are 4:3 art, stretched on a 16:9 console
++// [bf2mc patch] HUD layout while playing: the HUD's pieces (groups of quads close together) scaled by g_hud_scale,
++// those that stay put by the sides and corners about their corner or edge, moved g_hud_edge of the way from the 4:3
++// art's edge to the window's; pieces that move (markers over soldiers) about their own middle. g_hud_play_ms is
++// when the player's soldier last looked (steady clock ms): the layout is for play only.
++inline float g_hud_scale = 1.0f;
++inline float g_hud_edge = 0.0f;
++inline std::atomic<uint64_t> g_hud_play_ms{0};
+ // [bf2mc patch] the first person gun's x and y projection rows are scaled by this (1 the game's, below 1 wider)
+ inline float g_gun_zoom = 1.0f;
+ // [bf2mc patch] the world's x and y projection rows are scaled by this (the title's camera widened by as much)

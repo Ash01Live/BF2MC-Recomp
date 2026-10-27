@@ -1,0 +1,132 @@
+diff --git a/runtime/gpu/render_thread.cpp b/runtime/gpu/render_thread.cpp
+index 6a09afe..09b85cd 100644
+--- a/runtime/gpu/render_thread.cpp
++++ b/runtime/gpu/render_thread.cpp
+@@ -116,6 +116,7 @@ public:
+ 
+     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override {
+         auto t = Clock::now();
++        PrepareSnapshots(s, start, count, indices);
+         SendState(s);
+         Cmd c{Op::Draw};
+         c.a = prim;
+@@ -325,6 +326,12 @@ private:
+         Delta(&sent_.palettes, &palettes, sizeof(palettes));
+         auto streams = s.streams;
+         for (auto& st : streams) st.vb = Header(st.vb);
++        // [bf2mc patch] a draw from vertex memory the title rewrites reads the snapshot taken now
++        if (snap_on_) {
++            for (size_t i = 0; i < streams.size(); i++)
++                if (snap_override_[i]) streams[i].vb = snap_override_[i];
++            snap_on_ = false;
++        }
+         Delta(&sent_.streams, &streams, sizeof(streams));
+         Surface rt = s.rt, zs = s.zs;
+         rt.header = Header(rt.header);
+@@ -347,6 +354,92 @@ private:
+         cur_->cmds.push_back(c);
+     }
+ 
++    // [bf2mc patch] Vertex memory the title rewrites every frame (particles, sprites) is read by the render thread after
++    // the title has moved on and refilled it for other quads: smoke and light cones flickered or stretched across the
++    // screen. A vertex buffer whose bytes behind the same draw change is marked dynamic; from then on each of its
++    // draws up to kSnapMax bytes is copied now into a ring the render thread reads instead, through a header copy.
++    static constexpr uint32_t kSnapRing = 4u << 20, kSnapHalf = kSnapRing / 2, kSnapMax = 64u << 10;
++
++    static uint64_t Fingerprint(const uint8_t* p, uint32_t n) {
++        uint64_t h = 1469598103934665603ull ^ n;
++        auto mix = [&](const uint8_t* q, uint32_t m) {
++            for (uint32_t i = 0; i < m; i++) h = (h ^ q[i]) * 1099511628211ull;
++        };
++        uint32_t edge = std::min<uint32_t>(n, 64);
++        mix(p, edge);
++        if (n > edge) mix(p + n - edge, edge);
++        if (n > 256) mix(p + n / 2, 64);
++        return h;
++    }
++
++    uint32_t SnapCopy(const void* src, uint32_t n) {
++        if (!snap_) {
++            snap_ = mem::AllocContiguous(kSnapRing, 32u << 20, mem::kPhysicalSize - 1, 0x1000);
++            if (!snap_) snap_ = mem::AllocContiguous(kSnapRing, 0, 0xFFFFFFFF, 0x1000);
++            if (!snap_) return 0;
++        }
++        uint32_t room = (n + 63) & ~63u;
++        uint32_t pos = snap_pos_ + room > kSnapRing ? 0 : snap_pos_;
++        uint32_t from = snap_pos_ ? (snap_pos_ - 1) / kSnapHalf : 1, to = (pos + room - 1) / kSnapHalf;
++        if (to != from) {
++            snap_fence_[from] = Fence();
++            Wait(snap_fence_[to], WaitFor::Resource, nullptr);
++        }
++        std::memcpy(kernel::HostPtr(snap_ + pos), src, n);
++        snap_pos_ = pos + room;
++        return snap_ + pos;
++    }
++
++    void PrepareSnapshots(const State& s, uint32_t start, uint32_t count, const uint8_t* indices) {
++        snap_on_ = false;
++        if (!count) return;
++        uint32_t lo, hi;
++        if (indices) {
++            const uint16_t* ix = reinterpret_cast<const uint16_t*>(indices);
++            uint16_t a = 0xFFFF, b = 0;
++            for (uint32_t i = 0; i < count; i++) {
++                a = std::min(a, ix[i]);
++                b = std::max(b, ix[i]);
++            }
++            lo = a + s.base_vertex;
++            hi = b + s.base_vertex;
++        } else {
++            lo = start;
++            hi = start + count - 1;
++        }
++        if (hi < lo) return;
++        if (snap_seen_.size() > 200000) snap_seen_.clear();
++        for (size_t i = 0; i < s.streams.size(); i++) {
++            snap_override_[i] = 0;
++            const auto& st = s.streams[i];
++            if (!st.vb || !st.stride || (kernel::R32(st.vb) & 0x70000) != 0) continue;  // vertex buffers
++            uint64_t bytes = uint64_t(hi - lo + 1) * st.stride + 16;
++            if (bytes > kSnapMax) continue;
++            uint32_t pa = kernel::R32(st.vb + 4);
++            uint64_t base = uint64_t(lo) * st.stride;
++            const uint8_t* src = static_cast<const uint8_t*>(kernel::HostPtr(mem::VirtualFromPhysical(pa) + uint32_t(base)));
++            if (!dynamic_.count(st.vb)) {
++                uint64_t key = uint64_t(st.vb) << 32 ^ (uint64_t(pa) + base);
++                uint64_t h = Fingerprint(src, uint32_t(bytes));
++                auto [it, fresh] = snap_seen_.try_emplace(key, h);
++                bool changed = !fresh && it->second != h;
++                it->second = h;
++                if (!changed) continue;
++                dynamic_.insert(st.vb);
++            }
++            uint32_t at = SnapCopy(src, uint32_t(bytes));
++            if (!at) continue;
++            uint32_t pa_copy = mem::PhysicalFromVirtual(at);
++            if (pa_copy < base) continue;
++            uint8_t hdr[kHeaderBytes] = {};
++            std::memcpy(hdr, kernel::HostPtr(st.vb), 12);
++            uint32_t data = pa_copy - uint32_t(base);
++            std::memcpy(hdr + 4, &data, 4);
++            snap_override_[i] = Scratch(hdr, kHeaderBytes);
++            snap_on_ = true;
++        }
++    }
++
+     // resources by guest header: the batch that last read them
+     void Use(uint32_t header) {
+         if (!header) return;
+@@ -466,6 +559,13 @@ private:
+     std::array<Recent<uint64_t>, 64> recent_uses_{};
+     uint32_t ring_ = 0;
+     uint64_t ring_pos_ = 0;
++    // [bf2mc patch] snapshots of dynamic vertex memory
++    uint32_t snap_ = 0, snap_pos_ = 0;
++    uint64_t snap_fence_[2] = {};
++    std::unordered_map<uint64_t, uint64_t> snap_seen_;  // buffer and range start to the bytes last seen there
++    std::unordered_set<uint32_t> dynamic_;              // vertex buffer headers the title rewrites
++    uint32_t snap_override_[16] = {};
++    bool snap_on_ = false;
+     Batch* cur_ = nullptr;
+     State sent_;  // the state as the render thread will have it
+     std::unordered_map<uint32_t, uint64_t> last_use_;

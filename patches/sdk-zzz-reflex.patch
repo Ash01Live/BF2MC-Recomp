@@ -1,0 +1,189 @@
+diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
+index b650940..7fe317b 100644
+--- a/runtime/gpu/d3d12.cpp
++++ b/runtime/gpu/d3d12.cpp
+@@ -38,6 +38,9 @@
+ #include "gpu/texturedumper.h"
+ #include "gpu/vertex.h"
+ #include "kernel/kernel.h"
++#if HAS_NVAPI
++#include <nvapi.h>  // [bf2mc patch] NVIDIA Reflex
++#endif
+ 
+ using Microsoft::WRL::ComPtr;
+ 
+@@ -45,6 +48,9 @@ namespace gpu {
+ 
+ namespace {
+ 
++void ReflexInit(ID3D12Device* dev);  // [bf2mc patch] below, by Present
++void ReflexApply();
++
+ constexpr int kFrames = 3;
+ constexpr uint64_t kStaleFrames = 8;  // frames a target may go unused and still be read back
+ constexpr uint64_t kUploadSize = 64ull << 20;
+@@ -822,6 +828,7 @@ bool D3D12Backend::CreateDevice() {
+     DXGI_ADAPTER_DESC1 ad{};
+     if (adapter) adapter->GetDesc1(&ad);
+     LOGR("D3D12 adapter: %ls", adapter ? ad.Description : L"default");
++    ReflexInit(dev_.Get());  // [bf2mc patch]
+     D3D12_COMMAND_QUEUE_DESC qd{};
+     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+     dev_->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue_));
+@@ -3496,6 +3503,67 @@ void LogPerf() {
+     }
+ }
+ 
++// [bf2mc patch] NVIDIA Reflex. The device is the renderer's; the title's thread sleeps on it at each frame's start
++// (ReflexSleep) and marks the frame's simulation start and end, the render thread its present; the mode follows
++// g_reflex at each present.
++ID3D12Device* g_nv_dev = nullptr;
++std::atomic<uint64_t> g_nv_frame{0};
++std::atomic<int> g_nv_mode{-1};  // the mode the driver has
++std::mutex g_nv_lock;
++std::deque<uint64_t> g_nv_presents;  // frame ids handed over, oldest first
++
++#if HAS_NVAPI
++void NvMarker(NV_LATENCY_MARKER_TYPE type, uint64_t frame) {
++    NV_LATENCY_MARKER_PARAMS m{};
++    m.version = NV_LATENCY_MARKER_PARAMS_VER;
++    m.frameID = frame;
++    m.markerType = type;
++    NvAPI_D3D_SetLatencyMarker(g_nv_dev, &m);
++}
++#endif
++
++void ReflexInit(ID3D12Device* dev) {
++#if HAS_NVAPI
++    NvAPI_Status st = NvAPI_Initialize();
++    if (st == NVAPI_OK) {
++        g_nv_dev = dev;
++        g_reflex_state = 1;
++        LOGI("reflex: NVAPI ready");
++        return;
++    }
++    LOGI("reflex: not available (NVAPI %d)", int(st));
++#else
++    (void)dev;
++    LOGI("reflex: not built in");
++#endif
++    g_reflex_state = 0;
++}
++
++// the render thread, each present: the driver told of a mode change
++void ReflexApply() {
++#if HAS_NVAPI
++    int want = std::clamp(g_reflex.load(std::memory_order_relaxed), 0, 2);
++    static int asked = -1;
++    if (!g_nv_dev || want == asked) return;
++    asked = want;
++    NV_SET_SLEEP_MODE_PARAMS p{};
++    p.version = NV_SET_SLEEP_MODE_PARAMS_VER;
++    p.bLowLatencyMode = want > 0;
++    p.bLowLatencyBoost = want == 2;
++    p.minimumIntervalUs = 0;
++    p.bUseMarkersToOptimize = want > 0;
++    NvAPI_Status st = NvAPI_D3D_SetSleepMode(g_nv_dev, &p);
++    g_nv_mode = want;
++    if (st != NVAPI_OK) {
++        LOGI("reflex: the driver refused low latency mode (NVAPI %d)", int(st));
++        g_reflex_state = 0;
++        g_nv_mode = 0;  // asked again only when the setting changes
++        return;
++    }
++    LOGI("reflex: %s", want == 2 ? "on, boost" : want == 1 ? "on" : "off");
++#endif
++}
++
+ void D3D12Backend::Present(const Surface& front) {
+     PerfScope perf_present{g_perf.present};
+     // [bf2mc patch] F3 captures kCaptureBurst frames in a row, so a one frame event between them is caught
+@@ -3521,7 +3589,20 @@ void D3D12Backend::Present(const Surface& front) {
+     DeliverReports();
+     bool vsync = app::Get().vsync;
+     auto perf_swap = PerfClock::now();
++    // [bf2mc patch] Reflex: the mode, and the present marked with the frame the title handed over
++    ReflexApply();
++#if HAS_NVAPI
++    uint64_t nv_frame = 0;
++    if (g_nv_dev && g_nv_mode > 0) {
++        std::lock_guard lock(g_nv_lock);
++        if (!g_nv_presents.empty()) nv_frame = g_nv_presents.front(), g_nv_presents.pop_front();
++    }
++    if (nv_frame) NvMarker(RENDERSUBMIT_END, nv_frame), NvMarker(PRESENT_START, nv_frame);
++#endif
+     swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
++#if HAS_NVAPI
++    if (nv_frame) NvMarker(PRESENT_END, nv_frame);
++#endif
+     // [bf2mc patch] until the swap chain takes another frame; bounded, so a lost signal costs a frame, not a hang
+     constexpr DWORD kLatencyWaitMs = 100;
+     if (latency_) WaitForSingleObjectEx(latency_, kLatencyWaitMs, FALSE);
+@@ -3850,4 +3931,27 @@ void D3D12Backend::SetGamma(const uint8_t* ramp) {
+ 
+ std::unique_ptr<Backend> CreateBackend() { return std::make_unique<D3D12Backend>(); }
+ 
++void ReflexSleep() {
++#if HAS_NVAPI
++    if (!g_nv_dev || g_nv_mode <= 0) return;
++    NvAPI_D3D_Sleep(g_nv_dev);
++    uint64_t f = ++g_nv_frame;
++    NvMarker(SIMULATION_START, f);
++    NvMarker(INPUT_SAMPLE, f);  // the mouse is read early in the frame: the player's look
++#endif
++}
++
++void ReflexFrameEnd() {
++#if HAS_NVAPI
++    if (!g_nv_dev || g_nv_mode <= 0) return;
++    uint64_t f = g_nv_frame.load();
++    if (!f) return;
++    NvMarker(SIMULATION_END, f);
++    NvMarker(RENDERSUBMIT_START, f);
++    std::lock_guard lock(g_nv_lock);
++    g_nv_presents.push_back(f);
++    while (g_nv_presents.size() > 8) g_nv_presents.pop_front();
++#endif
++}
++
+ }  // namespace gpu
+diff --git a/runtime/gpu/ext.h b/runtime/gpu/ext.h
+index 20f9612..61d7bdc 100644
+--- a/runtime/gpu/ext.h
++++ b/runtime/gpu/ext.h
+@@ -108,6 +108,13 @@ inline bool g_low_latency = true;  // 2D: the title's HUD and menus are 4:3 art,
+ // those that stay put by the sides and corners about their corner or edge, moved g_hud_edge of the way from the 4:3
+ // art's edge to the window's; pieces that move (markers over soldiers) about their own middle. g_hud_play_ms is
+ // when the player's soldier last looked (steady clock ms): the layout is for play only.
++// [bf2mc patch] NVIDIA Reflex low latency mode (built with NVAPI, an NVIDIA GPU): 0 off, 1 on, 2 on with boost.
++// g_reflex_state: -1 not tried yet, 0 not available, 1 ready. ReflexSleep runs on the title's thread as a frame
++// starts (the threaded renderer's Present), so the title reads its input as late as the GPU allows.
++inline std::atomic<int> g_reflex{0};
++inline std::atomic<int> g_reflex_state{-1};
++void ReflexSleep();
++void ReflexFrameEnd();  // the title handed its frame over: the frame's id is queued for the present's markers
+ inline float g_hud_scale = 1.0f;
+ inline float g_hud_edge = 0.0f;
+ inline std::atomic<uint64_t> g_hud_play_ms{0};
+diff --git a/runtime/gpu/render_thread.cpp b/runtime/gpu/render_thread.cpp
+index 1f33e28..14e9cd3 100644
+--- a/runtime/gpu/render_thread.cpp
++++ b/runtime/gpu/render_thread.cpp
+@@ -25,6 +25,7 @@
+ #include "core/diag.h"
+ #include "core/log.h"
+ #include "gpu/backend.h"
++#include "gpu/ext.h"
+ #include "kernel/kernel.h"
+ #include "kernel/memory.h"
+ 
+@@ -198,6 +199,9 @@ public:
+         if (presents_) inner_->WaitGpuFrame(presents_ - 1);
+         presents_++;
+         last_present_ = id;
++        // [bf2mc patch] Reflex: the frame handed over, the next one starts here after the driver's sleep
++        ReflexFrameEnd();
++        ReflexSleep();
+     }
+ 
+     void Sync(uint32_t data, uint32_t) override { ReadBack(data, false); }

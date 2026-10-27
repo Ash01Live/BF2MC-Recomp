@@ -1,0 +1,155 @@
+diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
+index 1f4b151..1066001 100644
+--- a/runtime/gpu/d3d12.cpp
++++ b/runtime/gpu/d3d12.cpp
+@@ -77,6 +77,8 @@ struct Perf {
+     double wait = 0;
+     double swap = 0;
+     double sync = 0;
++    // [bf2mc patch] the rest of a draw, step by step
++    double shaders_ms = 0, pso_ms = 0, consts_ms = 0, views_ms = 0, geom_ms = 0, targets_ms = 0;
+     // counts and bytes
+     uint64_t draws = 0;
+     uint64_t verts = 0;
+@@ -2666,8 +2668,11 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+     if (!AssembleDraw(s, prim, start, count, indices, a)) return;
+     // past the ring every upload is a buffer of its own: seconds lost on a frame that draws a whole level once
+     if (CurrentFrame().used > kUploadSize - kUploadReserve) Submit(true);
++    auto pt = PerfClock::now();
+     if (!BindTargets(s)) return;
+     if (ext_ && ext_->Bound(*this, s, bound_rt_, bound_ds_, a.pretransformed) && !BindTargets(s)) return;
++    g_perf.targets_ms += PerfMs(pt);
++    pt = PerfClock::now();
+ 
+     // vertex shader
+     DrawShaders sh = ClassifyShaders(s, a, count);
+@@ -2683,6 +2688,8 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+     sh.pkey = Hash(&pk, sizeof(pk));
+     EnsurePixelShader(pk, sh);
+     if (!sh.vs_code || !sh.ps_code) return;
++    g_perf.shaders_ms += PerfMs(pt);
++    pt = PerfClock::now();
+ 
+     // pipeline
+     PsoKey k;
+@@ -2690,12 +2697,15 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+     ID3D12PipelineState* pso = EnsurePipeline(k, sh.vs_code, sh.ps_code);
+     if (!pso) return;
+     cl_->SetPipelineState(pso);
++    g_perf.pso_ms += PerfMs(pt);
++    pt = PerfClock::now();
+ 
+     // constants
+     GuestExtent size;
+     SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
+     DrawConstants c{};
+     UploadConstants(s, sh, k, stages, size, c);
++    g_perf.consts_ms += PerfMs(pt);
+ 
+     if (cap_) {
+         CaptureDraw(s, prim, count, k, c, stages);
+@@ -2704,14 +2714,18 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+     }
+ 
+     // texture views and samplers, viewport and scissor, blend factor and stencil reference
++    pt = PerfClock::now();
+     SetTextureViewsAndSamplers(s, a, stages);
+     SetViewportScissor(s, size.w);
+     SetBlendFactorStencilRef(s);
++    g_perf.views_ms += PerfMs(pt);
++    pt = PerfClock::now();
+ 
+     // geometry, counted while the title runs a visibility test
+     uint32_t query = BeginCountedDraw(s);
+     DrawGeometry(a);
+     EndCountedDraw(query);
++    g_perf.geom_ms += PerfMs(pt);
+ }
+ 
+ // a guest rect scaled to the target and clamped to it
+@@ -3159,12 +3173,12 @@ void LogPerf() {
+         Perf& p = g_perf;
+         double n = double(perf_frames);
+         double host = p.draw + p.clear + p.copy + p.present + p.sync;
+-        LOGI("perf: %.1f fps %.2f ms/frame | host %.2f (draw %.2f: assemble %.2f bind %.2f [check %.2f, upload %.2f] "
++        LOGR("perf: %.1f fps %.2f ms/frame | host %.2f (draw %.2f: assemble %.2f bind %.2f [check %.2f, upload %.2f] "
+              "compile %.2f; clear %.2f copy %.2f sync %.2f present %.2f [swap %.2f wait %.2f]) other %.2f",
+              n * 1000.0 / el, el / n, host / n, p.draw / n, p.assemble / n, p.bind / n, p.sig / n, p.texup / n,
+              p.compile / n, p.clear / n, p.copy / n, p.sync / n, p.present / n, p.swap / n, p.wait / n,
+              (el - host) / n);
+-        LOGI("perf: title thread per frame: recording %.2f ms, waiting %.2f ms (%.1f waits: read-back %.2f "
++        LOGR("perf: title thread per frame: recording %.2f ms, waiting %.2f ms (%.1f waits: read-back %.2f "
+              "resource %.2f fence %.2f flush %.2f copy %.2f, next frame %.2f) | read-backs waited for: %.1f lock, "
+              "%.1f NOOVERWRITE",
+              g_perf_capture_ns.exchange(0) / n / 1e6, g_perf_wait_ns.exchange(0) / n / 1e6,
+@@ -3173,13 +3187,15 @@ void LogPerf() {
+              g_perf_wait_kind_ns[3].exchange(0) / n / 1e6, g_perf_wait_kind_ns[4].exchange(0) / n / 1e6,
+              g_perf_wait_kind_ns[5].exchange(0) / n / 1e6, g_perf_sync_block.exchange(0) / n,
+              g_perf_sync_late.exchange(0) / n);
+-        LOGI("perf: per frame %.0f draws (%.0f raw) %.0fk verts %.1f MB upload %.1f overflow | %.0f checks %.2f MB "
++        LOGR("perf: per frame %.0f draws (%.0f raw) %.0fk verts %.1f MB upload %.1f overflow | %.0f checks %.2f MB "
+              "hashed | %.1f tex uploads %.2f MB, %.1f new tex, %.1f new targets, %.1f target uploads, %.1f shrinks, "
+              "%.1f read-backs %.1f late | %llu shaders %llu psos this second",
+              p.draws / n, p.raw / n, p.verts / n / 1000.0, p.upload / n / 1048576.0, p.overflow / n, p.sigs / n,
+              p.sig_bytes / n / 1048576.0, p.texups / n, p.texup_bytes / n / 1048576.0, p.newtex / n,
+              p.targets / n, p.rtups / n, p.shrinks / n, p.syncs / n, p.lates / n,
+              (unsigned long long)p.shaders, (unsigned long long)p.psos);
++        LOGR("perf: draw steps per frame: targets %.2f shaders %.2f pso %.2f constants %.2f views %.2f geometry %.2f ms",
++             p.targets_ms / n, p.shaders_ms / n, p.pso_ms / n, p.consts_ms / n, p.views_ms / n, p.geom_ms / n);
+         g_perf = Perf{};
+         perf_start = PerfClock::now();
+         perf_frames = 0;
+diff --git a/runtime/gpu/vertex.cpp b/runtime/gpu/vertex.cpp
+index 4fa29f2..a6afe35 100644
+--- a/runtime/gpu/vertex.cpp
++++ b/runtime/gpu/vertex.cpp
+@@ -1,3 +1,7 @@
++#include <mutex>
++#include <set>
++
++#include "core/diag.h"
+ #include "gpu/vertex.h"
+ 
+ #include <algorithm>
+@@ -276,8 +280,16 @@ bool RawReadable(const State& s, const Inputs& inputs) {
+         bool readable = he.format && stride && stride % kStrideAlign == 0 && in.offset < kElementOffsetEnd &&
+                         in.offset % std::min<uint32_t>(he.bytes, 4) == 0;
+         if (!readable) {
+-            LOG_FIRST(32, "vertex: converted on the CPU: v%d type %02X offset %u stride %u", inputs.regs[k], in.type,
+-                      in.offset, stride);
++            // [bf2mc patch] reported with XBE_PERF, each distinct case once
++            if (diag::Perf()) {
++                static std::mutex m;
++                static std::set<uint64_t> seen;
++                uint64_t key = uint64_t(in.type) << 48 | uint64_t(in.offset & 0xFFFF) << 32 | stride;
++                std::lock_guard<std::mutex> lock(m);
++                if (seen.size() < 64 && seen.insert(key).second)
++                    LOGR("perf: vertex converted on the CPU: v%d type %02X offset %u stride %u", inputs.regs[k], in.type,
++                         in.offset, stride);
++            }
+             return false;
+         }
+     }
+diff --git a/runtime/xdk/d3d8.cpp b/runtime/xdk/d3d8.cpp
+index 5b7484a..7744234 100644
+--- a/runtime/xdk/d3d8.cpp
++++ b/runtime/xdk/d3d8.cpp
+@@ -1,5 +1,6 @@
+ // Direct3D 8 (XDK 4831 and 5849) entry points the title calls, implemented on the host renderer.
+ // Resource creation, locking and the XG helpers stay recompiled: they only manage memory.
++#include <cstdlib>
+ #ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
+ #endif
+@@ -296,7 +297,10 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
+                         app::kGame.short_title, MB_ICONERROR | MB_TOPMOST);
+             kernel::Shutdown(1);
+         }
+-        if (kRenderThread) g_backend = gpu::CreateThreadedBackend(std::move(g_backend));
++        // [bf2mc patch] XBE_RENDER_THREAD=0 draws on the title's thread, for telling races from rendering faults
++        const char* rt = std::getenv("XBE_RENDER_THREAD");
++        bool threaded = kRenderThread && !(rt && rt[0] == '0');
++        if (threaded) g_backend = gpu::CreateThreadedBackend(std::move(g_backend));
+     }
+     g_state.viewport = {0, 0, w, h, 0.0f, 1.0f};
+     SetDev(kDevRenderTarget, g_buffers[1]);

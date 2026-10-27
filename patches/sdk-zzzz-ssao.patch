@@ -1,0 +1,309 @@
+diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
+index 7fe317b..bca1c06 100644
+--- a/runtime/gpu/d3d12.cpp
++++ b/runtime/gpu/d3d12.cpp
+@@ -49,6 +49,7 @@ namespace gpu {
+ namespace {
+ 
+ void ReflexInit(ID3D12Device* dev);  // [bf2mc patch] below, by Present
++uint32_t SimpleState(const State& s, uint32_t method);  // [bf2mc patch] below, for MaybeSsao
+ void ReflexApply();
+ 
+ constexpr int kFrames = 3;
+@@ -160,6 +161,71 @@ O vs(uint id : SV_VertexID) {
+ float psmain(O i) : SV_Depth { return img.SampleLevel(ps, i.uv, 0); }
+ )";
+ 
++// [bf2mc patch] SSAO. ao: from the frame's depth, each pixel's position in view space (the projection's tangents
++// across and down, near and far), a normal from its neighbours, and 12 samples on a disk of a fixed size in the
++// world around it: how much of the hemisphere above the surface they cover (the Alchemy estimator), faded with
++// distance. Into an R8 target. composite: a depth aware 4x4 blur of it, multiplied into the frame.
++const char* kSsaoHlsl = R"(
++Texture2D<float> t0 : register(t0);
++Texture2D<float> t1 : register(t1);
++cbuffer B : register(b1) { float4 p0; float4 p1; };  // w h tanx tany, near far radius strength
++struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
++O vs(uint id : SV_VertexID) {
++    O o;
++    o.uv = float2((id << 1) & 2, id & 2);
++    o.p = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
++    return o;
++}
++float Lin(float d) { return p1.x * p1.y / (p1.y - d * (p1.y - p1.x)); }
++float3 Pos(Texture2D<float> dt, int2 px) {
++    float z = Lin(dt.Load(int3(clamp(px, int2(0, 0), int2(p0.xy) - 1), 0)));
++    float2 ndc = (float2(px) + 0.5) / p0.xy * float2(2, -2) + float2(-1, 1);
++    return float3(ndc.x * p0.z * z, ndc.y * p0.w * z, z);
++}
++float ao(O i) : SV_Target {
++    int2 px = int2(i.p.xy);
++    float d = t0.Load(int3(px, 0));
++    if (d >= 0.99999) return 1;
++    float3 P = Pos(t0, px);
++    // the normal from the nearer neighbour each way, so edges keep their own side
++    float3 l = Pos(t0, px - int2(1, 0)), r = Pos(t0, px + int2(1, 0));
++    float3 u = Pos(t0, px - int2(0, 1)), b = Pos(t0, px + int2(0, 1));
++    float3 dx = abs(r.z - P.z) < abs(P.z - l.z) ? r - P : P - l;
++    float3 dy = abs(b.z - P.z) < abs(P.z - u.z) ? b - P : P - u;
++    float3 N = normalize(cross(dy, dx));
++    if (dot(N, P) > 0) N = -N;
++    float rpx = clamp(p1.z / (P.z * p0.z) * p0.x * 0.5, 3, 160);
++    float spin = frac(52.9829189 * frac(dot(float2(px), float2(0.06711056, 0.00583715)))) * 6.2831853;
++    float occ = 0;
++    [unroll] for (int k = 0; k < 12; k++) {
++        float t = (k + 0.5) / 12;
++        float a = spin + k * 2.3999632;  // golden angle
++        int2 q = px + int2(float2(cos(a), sin(a)) * rpx * t);
++        float3 v = Pos(t0, q) - P;
++        float vv = dot(v, v);
++        float f = saturate(1 - vv / (p1.z * p1.z));
++        occ += max(dot(v, N) - 0.002 * P.z, 0) / (vv + 0.0001) * f;
++    }
++    occ = occ * 2 * p1.z / 12;
++    return saturate(1 - p1.w * occ);
++}
++float4 composite(O i) : SV_Target {
++    int2 px = int2(i.p.xy);
++    float z = Lin(t1.Load(int3(px, 0)));
++    float sum = 0, wsum = 0;
++    [unroll] for (int y = -2; y < 2; y++)
++        [unroll] for (int x = -2; x < 2; x++) {
++            int2 q = clamp(px + int2(x, y), int2(0, 0), int2(p0.xy) - 1);
++            float w = 1 / (0.0001 + abs(Lin(t1.Load(int3(q, 0))) - z) / z * 40);
++            w = min(w, 1);
++            sum += t0.Load(int3(q, 0)) * w;
++            wsum += w;
++        }
++    float a = wsum > 0 ? sum / wsum : 1;
++    return float4(a, a, a, 1);
++}
++)";
++
+ const char* kClearHlsl = R"(
+ cbuffer B : register(b1) { float4 colour; };
+ float4 vs(uint id : SV_VertexID) : SV_Position {
+@@ -523,6 +589,16 @@ private:
+     // Draw, in call order, each callee right after its caller
+     bool DepthCopy(const State& s);
+     ID3D12PipelineState* EnsureDepthCopyPipeline();
++    // [bf2mc patch] SSAO
++    void MaybeSsao(const State& s);
++    void DrawSsao(Target& rt, Target& ds);
++    ID3D12PipelineState* EnsureSsaoPipeline(bool composite, DXGI_FORMAT fmt);
++    Microsoft::WRL::ComPtr<ID3D12Resource> ssao_rt_;
++    D3D12_RESOURCE_STATES ssao_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> ssao_rtv_heap_;
++    uint32_t ssao_w_ = 0, ssao_h_ = 0;
++    uint64_t ssao_frame_ = ~0ull, world_frame_ = ~0ull;
++    float display_aspect_ = 4.0f / 3.0f;
+     void DrawDepthCopy(Target& src, Target& dst, ID3D12PipelineState* pso);
+     bool AssembleDraw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices,
+                       Assembled& a);
+@@ -1256,6 +1332,142 @@ void D3D12Backend::DrawDepthCopy(Target& src, Target& dst, ID3D12PipelineState*
+     bound_rt_ = bound_ds_ = nullptr;
+ }
+ 
++// [bf2mc patch] SSAO's two pipelines: the occlusion into R8, the blurred occlusion multiplied into a target of fmt
++ID3D12PipelineState* D3D12Backend::EnsureSsaoPipeline(bool composite, DXGI_FORMAT fmt) {
++    uint64_t key = 0x55A0000000000000ull | (composite ? 0x100000000ull : 0) | uint64_t(fmt);
++    auto& pso = blit_psos_[key];
++    if (pso) return pso.Get();
++    uint64_t h;
++    ID3DBlob* vs = Compile(kSsaoHlsl, "vs", "vs_5_0", h);
++    ID3DBlob* ps = Compile(kSsaoHlsl, composite ? "composite" : "ao", "ps_5_0", h);
++    if (!vs || !ps) return nullptr;
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC p{};
++    p.pRootSignature = root_.Get();
++    p.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
++    p.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
++    p.SampleMask = UINT_MAX;
++    p.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
++    p.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
++    p.RasterizerState.DepthClipEnable = TRUE;
++    auto& bt = p.BlendState.RenderTarget[0];
++    bt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
++    if (composite) {
++        // the frame times the occlusion; its alpha kept
++        bt.BlendEnable = TRUE;
++        bt.SrcBlend = D3D12_BLEND_ZERO;
++        bt.DestBlend = D3D12_BLEND_SRC_COLOR;
++        bt.BlendOp = D3D12_BLEND_OP_ADD;
++        bt.SrcBlendAlpha = D3D12_BLEND_ZERO;
++        bt.DestBlendAlpha = D3D12_BLEND_ONE;
++        bt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
++    }
++    p.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++    p.NumRenderTargets = 1;
++    p.RTVFormats[0] = composite ? fmt : DXGI_FORMAT_R8_UNORM;
++    p.SampleDesc.Count = 1;
++    if (FAILED(dev_->CreateGraphicsPipelineState(&p, IID_PPV_ARGS(&pso)))) {
++        LOG_FIRST(1, "ssao: no pipeline");
++        return nullptr;
++    }
++    return pso.Get();
++}
++
++// [bf2mc patch] SSAO once a frame, while playing, as the first person gun or the first 2D draw (depth test ALWAYS:
++// the HUD) comes to a frame sized target after the frame's 3D (depth tested) draws: the world is done, the gun and
++// the HUD not yet drawn
++void D3D12Backend::MaybeSsao(const State& s) {
++    if (!bound_rt_ || !bound_ds_ || ssao_frame_ == frame_) return;
++    uint32_t gw, gh;
++    SurfaceSize(s.rt, gw, gh);
++    if (gw != guest_w_ || gh != guest_h_ || !s.rs[kRsZEnable]) return;
++    if (SimpleState(s, kMZFunc) != 0x207) {
++        // the first person gun (drawn zoomed apart from the world, as the ultrawide patch tells them apart) comes
++        // after the world: the occlusion goes in before it, so the gun and arms get none
++        bool gun = false;
++        if (gun_frame_ == frame_ && world_zoom_ > 0) {
++            const auto& r = s.vsc;
++            auto len = [](const std::array<float, 4>& x) { return std::sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]); };
++            float w = len(r[4]), zoom = w > 0 ? len(r[2]) / w : 0;
++            gun = zoom > 0 && std::fabs(zoom - world_zoom_) > world_zoom_ * 0.02f;
++        }
++        if (!gun) {
++            world_frame_ = frame_;
++            return;
++        }
++    }
++    if (world_frame_ != frame_) return;
++    uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
++                                std::chrono::steady_clock::now().time_since_epoch()).count());
++    if (now - g_hud_play_ms.load(std::memory_order_relaxed) > 250) return;
++    ssao_frame_ = frame_;
++    DrawSsao(*bound_rt_, *bound_ds_);
++    bound_rt_ = bound_ds_ = nullptr;
++}
++
++void D3D12Backend::DrawSsao(Target& rt, Target& ds) {
++    ID3D12PipelineState* ao = EnsureSsaoPipeline(false, DXGI_FORMAT_R8_UNORM);
++    ID3D12PipelineState* comp = EnsureSsaoPipeline(true, rt.fmt);
++    if (!ao || !comp || rt.w != ds.w || rt.h != ds.h) return;
++    if (!ssao_rtv_heap_) {
++        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
++        if (FAILED(dev_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&ssao_rtv_heap_)))) return;
++    }
++    if (!ssao_rt_ || ssao_w_ != rt.w || ssao_h_ != rt.h) {
++        if (ssao_rt_) Release(ssao_rt_);
++        ssao_rt_.Reset();
++        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
++        D3D12_RESOURCE_DESC td{};
++        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++        td.Width = rt.w;
++        td.Height = rt.h;
++        td.DepthOrArraySize = 1;
++        td.MipLevels = 1;
++        td.Format = DXGI_FORMAT_R8_UNORM;
++        td.SampleDesc.Count = 1;
++        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
++        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET,
++                                                 nullptr, IID_PPV_ARGS(&ssao_rt_)))) {
++            return;
++        }
++        ssao_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
++        dev_->CreateRenderTargetView(ssao_rt_.Get(), nullptr, ssao_rtv_heap_->GetCPUDescriptorHandleForHeapStart());
++        ssao_w_ = rt.w, ssao_h_ = rt.h;
++    }
++    if (cap_) fprintf(cap_, "%04u ssao\n", cap_i_++);
++    float tan_y = std::max(g_view_tan.load(std::memory_order_relaxed), 0.05f);
++    float c[8] = {float(rt.w), float(rt.h), tan_y * display_aspect_, tan_y,
++                  g_view_near.load(), g_view_far.load(), g_ssao_radius, g_ssao_strength * (g_ssao.load() == 2 ? 1.6f : 1.0f)};
++    // the occlusion
++    Transition(ds.res.Get(), ds.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++    Transition(ssao_rt_.Get(), ssao_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
++    D3D12_CPU_DESCRIPTOR_HANDLE ah = ssao_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
++    cl_->OMSetRenderTargets(1, &ah, FALSE, nullptr);
++    SetFullViewport(rt.w, rt.h);
++    uint32_t slot = AllocSrvSlots(2);
++    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
++    sv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
++    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++    sv.Texture2D.MipLevels = 1;
++    dev_->CreateShaderResourceView(ds.res.Get(), &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
++    dev_->CreateShaderResourceView(ds.res.Get(), &sv, Cpu(srv_heap_.Get(), slot + 1, srv_inc_));
++    Alloc cb = Upload(256, 256);
++    std::memcpy(cb.cpu, c, sizeof(c));
++    DrawFullScreen(ao, cb.gpu, slot);
++    // blurred, into the frame
++    Transition(ssao_rt_.Get(), ssao_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++    Transition(rt.res.Get(), rt.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
++    D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), rt.view, rtv_inc_);
++    cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
++    uint32_t slot2 = AllocSrvSlots(2);
++    D3D12_SHADER_RESOURCE_VIEW_DESC av = sv;
++    av.Format = DXGI_FORMAT_R8_UNORM;
++    dev_->CreateShaderResourceView(ssao_rt_.Get(), &av, Cpu(srv_heap_.Get(), slot2, srv_inc_));
++    dev_->CreateShaderResourceView(ds.res.Get(), &sv, Cpu(srv_heap_.Get(), slot2 + 1, srv_inc_));
++    DrawFullScreen(comp, cb.gpu, slot2);
++    rt.drawn = true;
++}
++
+ // a depth buffer drawn as colour into another depth buffer's memory: copied as depth
+ bool D3D12Backend::DepthCopy(const State& s) {
+     TextureDesc d;
+@@ -2968,6 +3180,10 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+     auto pt = perf ? PerfClock::now() : PerfClock::time_point{};
+     if (!BindTargets(s)) return;
+     if (ext_ && ext_->Bound(*this, s, bound_rt_, bound_ds_, a.pretransformed) && !BindTargets(s)) return;
++    if (g_ssao.load(std::memory_order_relaxed) > 0) {  // [bf2mc patch] before the first 2D on the frame
++        MaybeSsao(s);
++        if (!bound_rt_ && !BindTargets(s)) return;
++    }
+     if (perf) g_perf.targets_ms += PerfMs(pt);
+     if (perf) pt = PerfClock::now();
+ 
+@@ -2980,6 +3196,24 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+     // stage textures, then the pixel shader made for them
+     DrawTextures stages;
+     if (!BindStageTexturesAndTargets(s, stages)) return;
++    // [bf2mc patch] the game's own blur and haze off: while playing, a blended draw onto the frame that reads a frame
++    // sized target (the last frames blended back over this one) is left out
++    if (!g_game_blur.load(std::memory_order_relaxed) && bound_rt_ && SimpleState(s, kMBlendEnable)) {
++        uint32_t gw, gh;
++        SurfaceSize(s.rt, gw, gh);
++        bool reads_frame = false;
++        for (int i = 0; i < 4 && gw == guest_w_ && gh == guest_h_; i++) {
++            TextureDesc td;
++            if (stages.rt[i] && s.textures[size_t(i)] && Describe(s.textures[size_t(i)], td))
++                reads_frame |= td.width == guest_w_ && td.height == guest_h_;
++        }
++        uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
++                                    std::chrono::steady_clock::now().time_since_epoch()).count());
++        if (reads_frame && now - g_hud_play_ms.load(std::memory_order_relaxed) < 250) {
++            LOG_FIRST(4, "blur: a blended full screen pass left out (%u vertices)", count);
++            return;
++        }
++    }
+     PixelKey pk = MakePixelKey(s, stages.info);
+     pk.quad = sh.quad;
+     sh.pkey = Hash(&pk, sizeof(pk));
+@@ -3387,6 +3621,7 @@ void D3D12Backend::BlitFrame(Target& t) {
+     if (g_ultrawide && wide && w > h * aspect) aspect = w / h;
+     g_squeeze = g_ultrawide && wide ? 16.0f / 9.0f / aspect : 1.0f;
+     g_squeeze_2d = g_ultrawide && wide ? 4.0f / 3.0f / aspect : 1.0f;
++    display_aspect_ = aspect;  // [bf2mc patch] SSAO's view across
+     float vw = std::min(w, h * aspect);
+     float vh = vw / aspect;
+     float uv[4] = {0, 0, 1, 1};
+diff --git a/runtime/gpu/ext.h b/runtime/gpu/ext.h
+index 61d7bdc..f40d123 100644
+--- a/runtime/gpu/ext.h
++++ b/runtime/gpu/ext.h
+@@ -115,6 +115,16 @@ inline std::atomic<int> g_reflex{0};
+ inline std::atomic<int> g_reflex_state{-1};
+ void ReflexSleep();
+ void ReflexFrameEnd();  // the title handed its frame over: the frame's id is queued for the present's markers
++// [bf2mc patch] SSAO over the play world (0 off, 1 on, 2 strong), before the HUD: the view's projection the game set
++// (tangent of half its height's angle, near and far), the occlusion's reach in world units and its strength
++inline std::atomic<int> g_ssao{0};
++// [bf2mc patch] the game's own motion blur and haze (blended full screen passes reading the frame) while playing
++inline std::atomic<bool> g_game_blur{true};
++inline std::atomic<float> g_view_tan{0.6f};
++inline std::atomic<float> g_view_near{0.1f};
++inline std::atomic<float> g_view_far{300.0f};
++inline float g_ssao_radius = 1.0f;
++inline float g_ssao_strength = 1.0f;
+ inline float g_hud_scale = 1.0f;
+ inline float g_hud_edge = 0.0f;
+ inline std::atomic<uint64_t> g_hud_play_ms{0};

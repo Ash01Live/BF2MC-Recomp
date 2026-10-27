@@ -1,0 +1,136 @@
+diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
+index 5b479df..7c8d229 100644
+--- a/runtime/gpu/d3d12.cpp
++++ b/runtime/gpu/d3d12.cpp
+@@ -562,6 +562,7 @@ private:
+     void SetBlendFactorStencilRef(const State& s);
+     void DrawGeometry(const Assembled& a);
+     void UploadVertexBuffers(const Assembled& a);
++    void HudNative(const State& s, GuestExtent size, DrawConstants& c);  // [bf2mc patch]
+     // visibility tests
+     bool EnsureQueries();
+     uint32_t BeginCountedDraw(const State& s);
+@@ -2306,6 +2307,17 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
+     // screen passes) and draws without depth test (full screen fades and tints)
+     constexpr uint32_t kZAlways = 0x207;
+     c.squeeze[0] = 1;
++    c.hud[0] = c.hud[1] = 1;
++    // [bf2mc patch] 2D on the frame (zfunc ALWAYS, not one of its full screen passes): see HudNative
++    if (g_hud_native > 0 && size.w == guest_w_ && size.h == guest_h_ && k.zen && k.zfunc == 0x207) {
++        bool reads_frame = false;
++        for (int i = 0; i < 4; i++) {
++            TextureDesc td;
++            if (stages.rt[i] && s.textures[size_t(i)] && Describe(s.textures[size_t(i)], td))
++                reads_frame |= td.width == guest_w_ && td.height == guest_h_;
++        }
++        if (!reads_frame) HudNative(s, size, c);
++    }
+     if (g_squeeze != 1 && size.w == guest_w_ && size.h == guest_h_ && k.zen) {
+         bool reads_frame = false;
+         for (int i = 0; i < 4; i++) {
+@@ -2354,6 +2366,57 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
+     cl_->SetGraphicsRootConstantBufferView(1, dc.gpu);
+ }
+ 
++// [bf2mc patch] HUD art the title magnifies, shown at its own pixel size. The HUD is 640x480 art scaled to the window's
++// height (three host pixels a console pixel at 1440p), so art the title already draws larger than its texture (the
++// crosshair at 2.5 console pixels a texel, the mission text at about 2) came out as big blocks. Such a draw (a list of
++// axis aligned quads whose first quad shows a texel over at least 1.5 console pixels both ways) is scaled about the
++// middle of all its quads to g_hud_native host pixels a texel down, the same across. The rest of the HUD is drawn
++// near one texel a console pixel and is left as it is.
++void D3D12Backend::HudNative(const State& s, GuestExtent size, DrawConstants& c) {
++    constexpr float kMagnified = 1.5f;      // console pixels a texel from which a draw counts as magnified
++    constexpr uint32_t kMaxVertices = 4096;
++    constexpr uint32_t kMinTexture = 16;    // smaller: a solid colour, not art
++    const Assembled& a = asm_;
++    if (a.topology != Topology::Triangles || a.vertex_count < 4 || a.vertex_count > kMaxVertices || !bound_rt_) return;
++    if (!(a.regs & 1)) return;
++    const VertexElement& pe = a.elements[0];
++    if (pe.format != DXGI_FORMAT_R32G32B32_FLOAT && pe.format != DXGI_FORMAT_R32G32B32A32_FLOAT) return;
++    int uvr = -1;
++    for (int r = 1; r < 16 && uvr < 0; r++)
++        if ((a.regs >> r & 1) && a.elements[size_t(r)].format == DXGI_FORMAT_R32G32_FLOAT) uvr = r;
++    if (uvr < 0) return;
++    const VertexElement& te = a.elements[size_t(uvr)];
++    const VertexBuffer& pb = a.buffers[pe.buffer];
++    const VertexBuffer& tb = a.buffers[te.buffer];
++    if (!pb.src || !tb.src || !pb.stride || !tb.stride) return;
++    uint32_t n = a.vertex_count;
++    if (uint64_t(n - 1) * pb.stride + pe.offset + 8 > pb.bytes || uint64_t(3) * tb.stride + te.offset + 8 > tb.bytes) return;
++    TextureDesc td;
++    if (!s.textures[0] || !Describe(s.textures[0], td) || td.width < kMinTexture || td.height < kMinTexture) return;
++    auto pos = [&](uint32_t v, float* xy) { std::memcpy(xy, pb.src + size_t(v) * pb.stride + pe.offset, 8); };
++    auto uv = [&](uint32_t v, float* st) { std::memcpy(st, tb.src + size_t(v) * tb.stride + te.offset, 8); };
++    float p0[2], p1[2], p2[2], t0[2], t1[2], t2[2];
++    pos(0, p0), pos(1, p1), pos(2, p2), uv(0, t0), uv(1, t1), uv(2, t2);
++    // the first quad: an edge across, then one down
++    if (std::fabs(p1[1] - p0[1]) > 0.01f || std::fabs(p2[0] - p1[0]) > 0.01f) return;
++    float du = std::fabs(t1[0] - t0[0]) * td.width, dv = std::fabs(t2[1] - t1[1]) * td.height;
++    if (du < 1 || dv < 1) return;
++    float magx = std::fabs(p1[0] - p0[0]) / du, magy = std::fabs(p2[1] - p1[1]) / dv;
++    if (!(magx >= kMagnified && magy >= kMagnified)) return;
++    float lo[2] = {1e30f, 1e30f}, hi[2] = {-1e30f, -1e30f};
++    for (uint32_t v = 0; v < n; v++) {
++        float p[2];
++        pos(v, p);
++        for (int i = 0; i < 2; i++) lo[i] = std::min(lo[i], p[i]), hi[i] = std::max(hi[i], p[i]);
++    }
++    float host = float(bound_rt_->h) / float(size.h);  // host pixels a console pixel
++    // one scale both ways, from the height: the title draws some art wider than its texels (the crosshair, the mission
++    // text's letters), and that shape is kept
++    c.hud[0] = c.hud[1] = std::min(1.0f, g_hud_native / (host * magy));
++    c.hud[2] = (lo[0] + hi[0]) * 0.5f;
++    c.hud[3] = (lo[1] + hi[1]) * 0.5f;
++}
++
+ // [bf2mc patch] a 32 bit linear surface's guest memory as a top down bmp
+ static void CapWriteGuestBmp(const std::filesystem::path& path, uint32_t data, uint32_t w, uint32_t h) {
+     FILE* f = _wfopen(path.c_str(), L"wb");
+diff --git a/runtime/gpu/ext.h b/runtime/gpu/ext.h
+index bb6c472..40553c6 100644
+--- a/runtime/gpu/ext.h
++++ b/runtime/gpu/ext.h
+@@ -96,7 +96,10 @@ inline std::unique_ptr<Extension> g_extension;
+ // 2D (HUD, menus) stays a 16:9 block in the middle. Draws reading a render target (full screen passes) are left be.
+ inline bool g_ultrawide = false;
+ inline float g_squeeze = 1.0f;     // 16:9 over the window's shape, set each present
+-inline float g_squeeze_2d = 1.0f;  // 2D: the title's HUD and menus are 4:3 art, stretched on a 16:9 console
++inline float g_squeeze_2d = 1.0f;
++// [bf2mc patch] magnified HUD art (the crosshair, the mission text) drawn at this many host pixels per texel, about
++// its own centre; 0 leaves the HUD as the title draws it
++inline float g_hud_native = 0.0f;  // 2D: the title's HUD and menus are 4:3 art, stretched on a 16:9 console
+ // [bf2mc patch] the first person gun's x and y projection rows are scaled by this (1 the game's, below 1 wider)
+ inline float g_gun_zoom = 1.0f;
+ // [bf2mc patch] the world's x and y projection rows are scaled by this (the title's camera widened by as much)
+diff --git a/runtime/gpu/shaders.cpp b/runtime/gpu/shaders.cpp
+index ae6ccf7..7164dea 100644
+--- a/runtime/gpu/shaders.cpp
++++ b/runtime/gpu/shaders.cpp
+@@ -55,6 +55,7 @@ const char* kCommonTail = R"(    float4 spread[4];
+     float4 lt[56];
+     float4 rtshift;
+     float4 squeeze;
++    float4 hud;
+ };
+ )";
+ 
+@@ -227,6 +228,7 @@ const char* kVsEpilogue = R"(
+     // surf.w set: a point, which stays put since pulled out it would leave the target
+     if (surf.w == 0 && abs(p.x - (surf.x - 0.5)) < 1e-3) p.x = surf.x;
+     if (surf.w == 0 && abs(p.y - (surf.y - 0.5)) < 1e-3) p.y = surf.y;
++    if (hud.x != 1 || hud.y != 1) p.xy = hud.zw + (p.xy - hud.zw) * hud.xy;
+     q.x = (p.x * 2 / surf.x - 1) * squeeze.x;
+     q.y = 1 - p.y * 2 / surf.y;
+     q.z = p.z * surf.z;
+diff --git a/runtime/gpu/shaders.h b/runtime/gpu/shaders.h
+index 04cceba..4fd438a 100644
+--- a/runtime/gpu/shaders.h
++++ b/runtime/gpu/shaders.h
+@@ -102,6 +102,7 @@ struct DrawConstants {
+     float lt[8][7][4];   // per light: diffuse, specular, ambient, position range, direction falloff, attenuation, cos theta/2 phi/2
+     float rtshift[4];    // per kTexTarget stage: host pixels its reads move along x and y, negative up and left
+     float squeeze[4];    // [bf2mc patch] x: the draw's horizontal scale about the target's centre (g_squeeze)
++    float hud[4];        // [bf2mc patch] a HUD draw's scale (x, y) about a point (z, w) in target pixels; 1 1: none
+ };
+ 
+ }  // namespace gpu
